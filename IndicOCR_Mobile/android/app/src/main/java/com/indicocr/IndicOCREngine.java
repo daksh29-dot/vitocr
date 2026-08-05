@@ -120,8 +120,13 @@ public class IndicOCREngine implements AutoCloseable {
 
         for (int i = 0; i < n; i++) {
             Bitmap crop = crops.get(i);
-            float[] single = (crop != null) ? preprocessBitmap(crop) : new float[perImageSize];
-            System.arraycopy(single, 0, batchData, i * perImageSize, perImageSize);
+            if (crop != null && !crop.isRecycled()) {
+                float[] single = preprocessBitmap(crop);
+                System.arraycopy(single, 0, batchData, i * perImageSize, perImageSize);
+            } else {
+                // Fill with white padding if crop is null or recycled
+                java.util.Arrays.fill(batchData, i * perImageSize, (i + 1) * perImageSize, -1.0f);
+            }
         }
 
         return runInferenceBatch(batchData, n);

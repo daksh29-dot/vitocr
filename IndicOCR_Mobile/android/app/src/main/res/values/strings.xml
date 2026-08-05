@@ -11,4 +11,9 @@
     <string name="enable_performance_logging">Enable Performance Logging</string>
     <string name="clear_session_log">Clear Session Log</string>
     <string name="export_log_xlsx">Export Log (XLSX)</string>
+    <string name="online_recognition">Online Recognition</string>
+    <string name="enable_online_mode">Enable Online Mode</string>
+    <string name="back">Back</string>
+    <string name="online_mode">Online Mode</string>
+    <string name="offline_mode">Offline Mode</string>
 </resources>

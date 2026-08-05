@@ -143,23 +143,30 @@ public final class WordSegmenter {
         Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY);
         rgba.release();
 
-        // CLAHE (local contrast enhancement) before thresholding — a single
-        // global Otsu threshold can be correct in a well-lit part of a page
-        // and wrong in a shadowed part of the same photo. CLAHE equalizes
-        // contrast in small local tiles first, so Otsu's single global
-        // threshold has a much more uniform image to work with.
-        CLAHE clahe = Imgproc.createCLAHE(2.0, new Size(8, 8));
         Mat enhanced = new Mat();
-        clahe.apply(gray, enhanced);
-        gray.release();
-
-        Imgproc.GaussianBlur(enhanced, enhanced, new Size(3, 3), 0);
-
         Mat binary = new Mat();
-        Imgproc.threshold(enhanced, binary, 0, 255, Imgproc.THRESH_BINARY_INV + Imgproc.THRESH_OTSU);
-        enhanced.release();
-        // NOTE: binary is deliberately NOT released here — the oversized-region
-        // re-split pass below needs it, and is released after that pass runs.
+        CLAHE clahe = null;
+
+        try {
+            // CLAHE (local contrast enhancement) before thresholding
+            clahe = Imgproc.createCLAHE(2.0, new Size(8, 8));
+            clahe.apply(gray, enhanced);
+            gray.release();
+            clahe.collectGarbage();
+
+            Imgproc.GaussianBlur(enhanced, enhanced, new Size(3, 3), 0);
+
+            Imgproc.threshold(enhanced, binary, 0, 255, Imgproc.THRESH_BINARY_INV + Imgproc.THRESH_OTSU);
+            enhanced.release();
+        } catch (Exception e) {
+            gray.release();
+            enhanced.release();
+            binary.release();
+            if (clahe != null) {
+                clahe.collectGarbage();
+            }
+            throw e;
+        }
 
         // Pass 1: measure actual glyph size in this image (self-tuning).
         double medianGlyphHeight = estimateMedianGlyphHeight(binary);
@@ -223,9 +230,12 @@ public final class WordSegmenter {
 
         List<MatOfPoint> glyphContours = new ArrayList<>();
         Mat hierarchy = new Mat();
-        Imgproc.findContours(lightDilate, glyphContours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
-        lightDilate.release();
-        hierarchy.release();
+        try {
+            Imgproc.findContours(lightDilate, glyphContours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
+        } finally {
+            lightDilate.release();
+            hierarchy.release();
+        }
 
         List<Integer> heights = new ArrayList<>();
         for (MatOfPoint c : glyphContours) {
@@ -233,6 +243,7 @@ public final class WordSegmenter {
             c.release();
             if (r.height >= 4 && r.height <= 200) heights.add(r.height); // drop extreme outliers
         }
+        
         if (heights.isEmpty()) return -1;
         Collections.sort(heights);
         return heights.get(heights.size() / 2);
@@ -416,6 +427,12 @@ public final class WordSegmenter {
             out.add(new Rect(x + r.x, y + r.y, x + r.x + r.width, y + r.y + r.height));
         }
 
+        // Release any leftovers in the list
+        for (MatOfPoint c : contours) {
+            c.release();
+        }
+
+        region.release();
         out.sort((a, b) -> a.left - b.left);
         return out;
     }

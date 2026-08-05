@@ -1,11 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="preview_bg">#2C2C2C</color>
-    <color name="divider">#3D3D3D</color>
-
-    <!-- Additional UI Colors -->
-    <color name="colorAccent">@color/accent</color>
-    <color name="colorButtonLight">#2C2C2C</color>
+    <color name="primary">#A0A0A0</color>
     <color name="colorTextPrimary">@color/text_primary_dark</color>
-    <color name="colorOnAccent">#212121</color>
 </resources>

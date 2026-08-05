@@ -80,35 +80,56 @@
     </androidx.cardview.widget.CardView>
 
     <!-- Run / Cancel Actions -->
-    <LinearLayout
+    <androidx.constraintlayout.widget.ConstraintLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:orientation="horizontal"
         android:layout_marginBottom="16dp">
 
         <Button
             android:id="@+id/runBtn"
             android:layout_width="0dp"
             android:layout_height="50dp"
-            android:layout_weight="1"
             android:text="▶ Run"
             android:backgroundTint="@color/primary"
             android:textColor="#FFFFFF"
             android:textAllCaps="false"
             android:enabled="false"
-            android:layout_marginEnd="8dp"/>
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintEnd_toStartOf="@+id/cancelBtn"
+            app:layout_constraintHorizontal_chainStyle="spread"
+            app:layout_constraintTop_toTopOf="parent"
+            android:layout_marginEnd="4dp"/>
 
         <Button
             android:id="@+id/cancelBtn"
             android:layout_width="0dp"
             android:layout_height="50dp"
-            android:layout_weight="1"
             android:text="⏹ Terminate"
             android:backgroundTint="#D32F2F"
             android:textColor="#FFFFFF"
             android:textAllCaps="false"
-            android:visibility="gone"/>
-    </LinearLayout>
+            android:visibility="gone"
+            app:layout_constraintStart_toEndOf="@+id/runBtn"
+            app:layout_constraintEnd_toStartOf="@+id/shareBtn"
+            app:layout_constraintTop_toTopOf="parent"
+            android:layout_marginStart="4dp"
+            android:layout_marginEnd="4dp"/>
+
+        <Button
+            android:id="@+id/shareBtn"
+            android:layout_width="0dp"
+            android:layout_height="50dp"
+            android:text="Share Results"
+            android:backgroundTint="@color/accent"
+            android:textColor="#FFFFFF"
+            android:textAllCaps="false"
+            android:enabled="false"
+            app:layout_constraintStart_toEndOf="@+id/cancelBtn"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintTop_toTopOf="parent"
+            android:layout_marginStart="4dp"/>
+
+    </androidx.constraintlayout.widget.ConstraintLayout>
 
     <!-- Progress Card -->
     <androidx.cardview.widget.CardView

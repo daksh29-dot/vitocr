@@ -144,17 +144,7 @@ public class EvalActivity extends AppCompatActivity {
         logText      = findViewById(R.id.logText);
         summaryText  = findViewById(R.id.summaryText);
         logScroll    = findViewById(R.id.logScroll);
-
-        // ── Share button, added programmatically ─────────────────────────
-        // No layout XML edit required: this inserts a "Share Results" button
-        // right after the terminate button, in the same parent container.
-        shareBtn = new Button(this);
-        shareBtn.setText("Share Results");
-        shareBtn.setEnabled(false); // enabled once a file exists to share
-        ViewGroup parent = (ViewGroup) terminateBtn.getParent();
-        int index = parent.indexOfChild(terminateBtn);
-        ViewGroup.LayoutParams lp = terminateBtn.getLayoutParams();
-        parent.addView(shareBtn, index + 1, lp);
+        shareBtn     = findViewById(R.id.shareBtn);
     }
 
     private void setupListeners() {
@@ -399,6 +389,7 @@ public class EvalActivity extends AppCompatActivity {
         }
         terminateBtn.setEnabled(running);
         terminateBtn.setVisibility(running ? View.VISIBLE : View.GONE);
+        
         browseFolderBtn.setEnabled(!running);
         folderInput.setEnabled(!running);
     }

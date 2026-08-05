@@ -19,7 +19,7 @@
         <item name="colorOnSurface">@color/text_primary_light</item>
     </style>
 
-    <style name="Theme.OCRTool.NoActionBar">
+    <style name="Theme.OCRTool.NoActionBar" parent="Theme.OCRTool">
         <item name="windowActionBar">false</item>
         <item name="windowNoTitle">true</item>
     </style>

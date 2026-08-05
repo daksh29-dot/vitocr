@@ -11,7 +11,6 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.View;
-import android.content.SharedPreferences;
 import android.widget.ImageButton;
 import android.widget.ImageView;
 import android.widget.TextView;
@@ -67,17 +66,18 @@ public class MainActivity extends AppCompatActivity {
     private PreviewView    cameraPreview;
     private View           scanGrid;
     private ImageView      imagePreview;
-    private View           cameraCard;
-    private View           previewCard;
     private TextView       tvResult;
     private ImageButton    btnCapture;
-    private ImageButton    btnBack;
     private ImageButton    btnGallery;
     private ImageButton    btnEval; // Added for Batch Evaluation
     private ImageButton    btnSearch; // Global search across saved scans
+    private ImageButton    btnOnlineToggle;
     private ImageButton    btnSettings; // Doubles as the light/dark theme toggle for now
     private TextView       btnModeWord;
     private TextView       btnModePage;
+
+    private View           cameraCard;
+    private View           previewCard;
 
     /** false = single word, fast path (no segmentation). true = full page, runs WordSegmenter. */
     private boolean pageMode = false;
@@ -85,6 +85,7 @@ public class MainActivity extends AppCompatActivity {
     // ── OCR ───────────────────────────────────────────────────────────────────
     private IndicOCREngine ocrEngine;
     private TextDetector textDetector; // null if the learned detector model isn't bundled — falls back to WordSegmenter
+    private OnlineOcrClient onlineOcrClient;
 
     // ── Camera ────────────────────────────────────────────────────────────────
     private ImageCapture   imageCapture;
@@ -141,19 +142,22 @@ public class MainActivity extends AppCompatActivity {
         cameraPreview = findViewById(R.id.cameraPreview);
         scanGrid      = findViewById(R.id.scanGrid);
         imagePreview  = findViewById(R.id.imagePreview);
-        cameraCard    = findViewById(R.id.cameraCard);
-        previewCard   = findViewById(R.id.previewCard);
         tvResult      = findViewById(R.id.tvResult);
         btnCapture    = findViewById(R.id.btnCapture);
-        btnBack       = findViewById(R.id.btnBack);
         btnGallery    = findViewById(R.id.btnGallery);
         btnEval       = findViewById(R.id.btnEval); // Initialized bottom sheet view binding
         btnSearch     = findViewById(R.id.btnSearch);
         btnSettings   = findViewById(R.id.btnSettings); // Doubles as the theme toggle
+        btnOnlineToggle = findViewById(R.id.btnOnlineToggle);
         btnModeWord   = findViewById(R.id.btnModeWord);
         btnModePage   = findViewById(R.id.btnModePage);
 
+        cameraCard    = findViewById(R.id.cameraCard);
+        previewCard   = findViewById(R.id.previewCard);
+
         SelectableTextHelper.enable(this, tvResult); // Long-press result text: Copy / Search Web / Translate / Share
+
+        onlineOcrClient = new OnlineOcrClient(getApplicationContext());
 
         cameraExecutor = Executors.newSingleThreadExecutor();
         dbExecutor     = Executors.newSingleThreadExecutor();
@@ -173,11 +177,11 @@ public class MainActivity extends AppCompatActivity {
         btnSearch.setOnClickListener(v ->
             startActivity(new Intent(this, GlobalSearchActivity.class)));
 
-        // Setup listener for navigation to Settings
-        btnSettings.setOnClickListener(v ->
-            startActivity(new Intent(this, SettingsActivity.class)));
+        btnOnlineToggle.setOnClickListener(v -> toggleOnlineMode());
 
-        btnBack.setOnClickListener(v -> showPreviewMode(false));
+        // Doubles as the light/dark toggle for now — split into a real
+        // settings screen later if you add more preferences.
+        btnSettings.setOnClickListener(v -> startActivity(new Intent(this, SettingsActivity.class)));
 
         btnModeWord.setOnClickListener(v -> setPageMode(false));
         btnModePage.setOnClickListener(v -> setPageMode(true));
@@ -193,10 +197,32 @@ public class MainActivity extends AppCompatActivity {
     }
 
     @Override
+    protected void onResume() {
+        super.onResume();
+        updateOnlineToggleIcon();
+    }
+
+    @Override
     protected void onDestroy() {
         super.onDestroy();
         cameraExecutor.shutdown();
         if (ocrEngine != null) ocrEngine.close();
+    }
+
+    private void toggleOnlineMode() {
+        boolean current = AppSettings.isOnlineMode(this);
+        if (!current && !AppSettings.hasApiUrl(this)) {
+            Toast.makeText(this, "Set a Server URL in Settings to enable Cloud mode", Toast.LENGTH_LONG).show();
+            return;
+        }
+        AppSettings.setOnlineMode(this, !current);
+        updateOnlineToggleIcon();
+        Toast.makeText(this, !current ? "Cloud Recognition Enabled" : "Offline Recognition (On-Device)", Toast.LENGTH_SHORT).show();
+    }
+
+    private void updateOnlineToggleIcon() {
+        boolean online = AppSettings.isOnlineMode(this);
+        btnOnlineToggle.setImageResource(online ? R.drawable.ic_cloud : R.drawable.ic_cloud_off);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -218,11 +244,7 @@ public class MainActivity extends AppCompatActivity {
             // to WordSegmenter's classical approach if this stays null.
             if (TextDetector.isModelBundled(getApplicationContext())) {
                 textDetector = new TextDetector(getApplicationContext());
-                if (textDetector.isReady()) {
-                    Log.i(TAG, "Learned text detector ready — Page mode will use it instead of WordSegmenter");
-                } else {
-                    Log.w(TAG, "det_model.onnx found but failed to load, falling back to WordSegmenter");
-                }
+                Log.i(TAG, "Learned text detector ready — Page mode will use it instead of WordSegmenter");
             } else {
                 Log.i(TAG, "No det_model.onnx bundled — Page mode will use classical WordSegmenter");
             }
@@ -291,7 +313,9 @@ public class MainActivity extends AppCompatActivity {
 
     private void processAutoCrop(File photoFile) {
         try {
-            Bitmap fullBmp = BitmapFactory.decodeFile(photoFile.getAbsolutePath());
+            BitmapFactory.Options options = new BitmapFactory.Options();
+            options.inSampleSize = 2; // Decode at half resolution for auto-crop logic (saves ~75% memory)
+            Bitmap fullBmp = BitmapFactory.decodeFile(photoFile.getAbsolutePath(), options);
             if (fullBmp == null) {
                 launchCropper(Uri.fromFile(photoFile));
                 return;
@@ -336,10 +360,13 @@ public class MainActivity extends AppCompatActivity {
                 // Save cropped version to a new file to pass to uCrop (optional) or recogniser
                 File croppedFile = new File(getExternalCacheDir(), "autocrop_" + System.currentTimeMillis() + ".jpg");
                 try (FileOutputStream out = new FileOutputStream(croppedFile)) {
-                    croppedBmp.compress(Bitmap.CompressFormat.JPEG, 100, out);
+                    croppedBmp.compress(Bitmap.CompressFormat.JPEG, 90, out);
                 }
                 
+                // RECYCLE: Free memory immediately
                 fullBmp.recycle();
+                croppedBmp.recycle();
+
                 // Pass the pre-cropped image to uCrop so the user just fine-tunes it
                 launchCropper(Uri.fromFile(croppedFile));
             } else {
@@ -365,6 +392,7 @@ public class MainActivity extends AppCompatActivity {
             uOptions.setHideBottomControls(false);
             uOptions.setImageToCropBoundsAnimDuration(100);
             uOptions.setMaxScaleMultiplier(20f);
+            uOptions.useSourceImageAspectRatio();
 
             UCrop uCrop = UCrop.of(normalizedUri, destinationUri)
                 .withOptions(uOptions)
@@ -381,10 +409,19 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private Uri normalizeForCrop(Uri sourceUri) throws IOException {
-        int targetLongSide = 2000;
+        int targetLongSide = 1600; // Slightly lower for better memory stability on low-end devices
+
+        BitmapFactory.Options options = new BitmapFactory.Options();
+        options.inJustDecodeBounds = true;
+        try (InputStream is = getContentResolver().openInputStream(sourceUri)) {
+            BitmapFactory.decodeStream(is, null, options);
+        }
+
+        options.inSampleSize = calculateInSampleSize(options, targetLongSide, targetLongSide);
+        options.inJustDecodeBounds = false;
 
         try (InputStream is = getContentResolver().openInputStream(sourceUri)) {
-            Bitmap original = BitmapFactory.decodeStream(is);
+            Bitmap original = BitmapFactory.decodeStream(is, null, options);
             if (original == null) throw new IOException("Failed to decode bitmap");
 
             int w = original.getWidth();
@@ -392,16 +429,24 @@ public class MainActivity extends AppCompatActivity {
             int longSide = Math.max(w, h);
             float scale = (float) targetLongSide / longSide;
 
-            int newW = Math.round(w * scale);
-            int newH = Math.round(h * scale);
-            Bitmap normalized = Bitmap.createScaledBitmap(original, newW, newH, true);
+            Bitmap normalized;
+            if (scale < 1.0f) {
+                int newW = Math.round(w * scale);
+                int newH = Math.round(h * scale);
+                normalized = Bitmap.createScaledBitmap(original, newW, newH, true);
+            } else {
+                normalized = original;
+            }
 
             File tmp = new File(getCacheDir(), "ucrop_normalized.jpg");
             try (FileOutputStream out = new FileOutputStream(tmp)) {
-                normalized.compress(Bitmap.CompressFormat.JPEG, 95, out);
+                normalized.compress(Bitmap.CompressFormat.JPEG, 90, out);
             }
-            original.recycle();
-            normalized.recycle();
+            
+            if (normalized != original) original.recycle();
+            // Don't recycle normalized here if we're going to use its URI immediately, 
+            // but since we saved to file and return the URI, we can recycle if it's different.
+            // Actually, uCrop will read from the file.
 
             return Uri.fromFile(tmp);
         }
@@ -414,6 +459,12 @@ public class MainActivity extends AppCompatActivity {
             BitmapFactory.decodeStream(is, null, options);
         } catch (IOException e) {
             Log.e(TAG, "Validation error: " + e.getMessage());
+        }
+
+        if (options.outWidth < 10 || options.outHeight < 10) {
+            Toast.makeText(this, "Crop too small. Please try again.", Toast.LENGTH_LONG).show();
+            btnCapture.setEnabled(true);
+            return;
         }
 
         recogniseFromUri(uri);
@@ -466,7 +517,9 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void runRecognition(Bitmap bmp) {
-        if (ocrEngine == null) {
+        boolean onlineMode = AppSettings.isOnlineMode(getApplicationContext());
+
+        if (ocrEngine == null && !onlineMode) {
             runOnUiThread(() -> {
                 tvResult.setText("Engine not ready yet…");
                 btnCapture.setEnabled(true);
@@ -478,14 +531,26 @@ public class MainActivity extends AppCompatActivity {
 
         runOnUiThread(() -> {
             imagePreview.setImageBitmap(processedBmp);
-            showPreviewMode(true);
+            previewCard.setVisibility(android.view.View.VISIBLE);
+            cameraCard.setVisibility(android.view.View.GONE);
         });
+
+        // RECYCLE: Free the original bitmap immediately to save memory
+        if (processedBmp != bmp) {
+            bmp.recycle();
+        }
 
         try {
             long t0 = System.currentTimeMillis();
             String text;
 
-            if (!pageMode) {
+            if (onlineMode) {
+                // Online mode sends the whole crop to the hosted model in one
+                // call — Word/Page mode toggle only applies to on-device
+                // recognition, since the server side handles its own
+                // segmentation strategy (or doesn't need one).
+                text = onlineOcrClient.recognise(processedBmp);
+            } else if (!pageMode) {
                 // Fast path — exactly what this model was trained for: one
                 // word crop, one inference call, no segmentation overhead.
                 text = ocrEngine.recognise(processedBmp);
@@ -493,58 +558,76 @@ public class MainActivity extends AppCompatActivity {
                 List<WordSegmenter.WordBox> words = (textDetector != null)
                         ? textDetector.detect(processedBmp)
                         : WordSegmenter.segment(processedBmp);
+
+                // Debug: save every detected box drawn on the page, so
+                // segmentation quality can be checked visually rather than
+                // inferred from the OCR output alone.
+                String debugPath = DebugVisualizer.drawAndSave(
+                        getApplicationContext(), processedBmp, words,
+                        textDetector != null ? "detector" : "segmentation");
+                if (debugPath != null) Log.i(TAG, "Debug overlay: " + debugPath);
+
                 text = words.isEmpty() ? ocrEngine.recognise(processedBmp) : recogniseWords(processedBmp, words);
             }
 
             long ms = System.currentTimeMillis() - t0;
-            Log.i(TAG, "Recognised (" + (pageMode ? "page" : "word") + " mode) in " + ms + " ms: " + text);
+            Log.i(TAG, "Recognised (" + (onlineMode ? "online" : (pageMode ? "page" : "word")) + " mode) in " + ms + " ms: " + text);
             String finalText = text;
             runOnUiThread(() -> {
                 tvResult.setText(finalText.isEmpty() ? "(no text detected)" : finalText);
                 btnCapture.setEnabled(true);
-                if (!finalText.isEmpty()) promptSaveToFolder(finalText, processedBmp);
+                if (!finalText.isEmpty() && !isFinishing()) {
+                    promptSaveToFolder(finalText, processedBmp);
+                }
             });
-        } catch (OrtException e) {
-            Log.e(TAG, "Inference error: " + e.getMessage());
+        } catch (Exception e) {
+            Log.e(TAG, "Recognition failed", e);
             runOnUiThread(() -> {
-                tvResult.setText("Inference error: " + e.getMessage());
+                tvResult.setText("Recognition failed: " + e.getMessage());
                 btnCapture.setEnabled(true);
             });
-        } finally {
-            if (processedBmp != bmp) bmp.recycle();
         }
     }
 
     /** Recognises every segmented word and reassembles them into lines (space within a line, newline between lines). */
     private String recogniseWords(Bitmap page, List<WordSegmenter.WordBox> words) throws OrtException {
-        // Crop every word first (fast, no model involved), then hand the
-        // whole batch to the model in one call instead of N sequential
-        // calls — this is the actual speed fix, same model either way.
-        List<Bitmap> crops = new ArrayList<>(words.size());
-        for (WordSegmenter.WordBox w : words) {
-            crops.add(WordSegmenter.crop(page, w.rect));
-        }
-
-        List<String> recognisedWords = ocrEngine.recogniseBatch(crops);
-
-        for (Bitmap crop : crops) {
-            if (crop != null) crop.recycle();
-        }
-
         StringBuilder sb = new StringBuilder();
         int currentLine = -1;
-        for (int i = 0; i < words.size(); i++) {
-            WordSegmenter.WordBox w = words.get(i);
-            if (crops.get(i) == null) continue; // degenerate box, nothing was recognised for it
 
-            if (w.lineIndex != currentLine) {
-                if (currentLine != -1) sb.append('\n');
-                currentLine = w.lineIndex;
-            } else if (sb.length() > 0) {
-                sb.append(' ');
+        // Process in micro-batches to keep memory usage low. 
+        // Page mode can detect 100+ words; cropping them all at once 
+        // can easily spike RAM to 200MB+ on high-res photos.
+        final int MICRO_BATCH_SIZE = 8;
+        
+        for (int i = 0; i < words.size(); i += MICRO_BATCH_SIZE) {
+            int end = Math.min(i + MICRO_BATCH_SIZE, words.size());
+            List<Bitmap> batchCrops = new ArrayList<>();
+            
+            for (int j = i; j < end; j++) {
+                batchCrops.add(WordSegmenter.crop(page, words.get(j).rect));
             }
-            sb.append(recognisedWords.get(i));
+
+            List<String> recognisedBatch = ocrEngine.recogniseBatch(batchCrops);
+
+            for (int j = 0; j < batchCrops.size(); j++) {
+                int globalIdx = i + j;
+                WordSegmenter.WordBox w = words.get(globalIdx);
+                String text = recognisedBatch.get(j);
+                
+                if (w.lineIndex != currentLine) {
+                    if (currentLine != -1) sb.append('\n');
+                    currentLine = w.lineIndex;
+                } else if (sb.length() > 0 && sb.charAt(sb.length() - 1) != '\n') {
+                    sb.append(' ');
+                }
+                sb.append(text);
+
+                // RECYCLE IMMEDIATELY: Don't wait for the whole page to finish
+                Bitmap crop = batchCrops.get(j);
+                if (crop != null) crop.recycle();
+            }
         }
+        
         return sb.toString();
     }
 
@@ -585,17 +668,6 @@ public class MainActivity extends AppCompatActivity {
         return Bitmap.createBitmap(bitmap, left, top, (right - left + 1), (bottom - top + 1));
     }
 
-    private void showPreviewMode(boolean show) {
-        previewCard.setVisibility(show ? View.VISIBLE : View.GONE);
-        cameraCard.setVisibility(show ? View.GONE : View.VISIBLE);
-        btnBack.setVisibility(show ? View.VISIBLE : View.GONE);
-
-        if (!show) {
-            tvResult.setText("Point camera at text and tap Capture");
-            imagePreview.setImageBitmap(null);
-        }
-    }
-
     private void setPageMode(boolean isPage) {
         pageMode = isPage;
         int textPrimary = androidx.core.content.ContextCompat.getColor(this, R.color.colorTextPrimary);
@@ -611,31 +683,9 @@ public class MainActivity extends AppCompatActivity {
     // Light / dark theme
     // ─────────────────────────────────────────────────────────────────────────
 
-    private static final String THEME_PREFS = "OCR_Settings";
-    private static final String KEY_NIGHT_MODE = "theme_mode";
-
     /** Reads the saved theme choice and applies it. Must run before super.onCreate(). */
     private void applyTheme() {
-        SharedPreferences prefs = getSharedPreferences(THEME_PREFS, MODE_PRIVATE);
-        int savedMode = prefs.getInt(KEY_NIGHT_MODE, AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM);
-        AppCompatDelegate.setDefaultNightMode(savedMode);
-    }
-
-    private void toggleTheme() {
-        int current = AppCompatDelegate.getDefaultNightMode();
-        boolean isCurrentlyNight = (getResources().getConfiguration().uiMode
-                & android.content.res.Configuration.UI_MODE_NIGHT_MASK)
-                == android.content.res.Configuration.UI_MODE_NIGHT_YES;
-
-        int newMode = isCurrentlyNight ? AppCompatDelegate.MODE_NIGHT_NO : AppCompatDelegate.MODE_NIGHT_YES;
-
-        getSharedPreferences(THEME_PREFS, MODE_PRIVATE)
-                .edit()
-                .putInt(KEY_NIGHT_MODE, newMode)
-                .apply();
-
-        AppCompatDelegate.setDefaultNightMode(newMode);
-        recreate();
+        AppCompatDelegate.setDefaultNightMode(AppSettings.getNightMode(getApplicationContext()));
     }
 
     private boolean isBlack(int pixel, int threshold) {
