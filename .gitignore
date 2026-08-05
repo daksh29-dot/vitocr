@@ -1,0 +1,109 @@
+# =============================================================================
+# IndicOCR_Mobile — .gitignore
+# Covers: Android/Gradle app, Python training & quantization scripts,
+#         model artifacts, and IDE/OS clutter.
+# =============================================================================
+
+# ── Android / Gradle build output ───────────────────────────────────────────
+*.iml
+.gradle/
+build/
+/captures
+.externalNativeBuild/
+.cxx/
+local.properties
+*.apk
+*.aab
+*.ap_
+*.dex
+output.json
+android/app/build/
+android/build/
+android/.gradle/
+
+# ── Generated artifacts / analysis reports ───────────────────────────────────
+.artifacts/
+android.artifacts/
+**/app/release/
+code_analysis_report.txt
+
+# ── Signing / keystores — NEVER commit these ────────────────────────────────
+*.jks
+*.keystore
+keystore.properties
+key.properties
+
+# ── Android Studio / IntelliJ ────────────────────────────────────────────────
+.idea/
+*.iws
+*.ipr
+caches/
+libraries/
+# Keep shared run configs and code style if you use them; uncomment if not:
+# .idea/*
+
+# ── VS Code (if used alongside Android Studio) ───────────────────────────────
+.vscode/
+
+# ── Native / NDK ──────────────────────────────────────────────────────────────
+obj/
+*.so
+
+# ── Large model / weight files ───────────────────────────────────────────────
+# These belong in a release/artifact store or Git LFS, not plain git history —
+# they're large, binary, and change independently of source code.
+*.onnx
+*.pt
+*.pth
+*.pdparams
+*.pdmodel
+*.pdiparams
+*.pdiparams.info
+*.tar
+checkpoints/
+det_onnx/
+# If you DO want specific small models tracked (e.g. a tiny label_map.json
+# or a deliberately-committed demo model), add explicit exceptions below:
+# !app/src/main/assets/label_map.json
+
+# ── Dataset / bulk images ────────────────────────────────────────────────────
+# The 30,000-image training/eval dataset and any batch-eval outputs don't
+# belong in git history.
+datasets/
+*.csv
+*.xlsx
+!sample_*.csv
+
+# ── On-device debug artifacts ────────────────────────────────────────────────
+# If you ever `adb pull` these into the repo folder for inspection.
+debug_segmentation/
+
+# ── Python (training pipeline, quantize_model.py, etc.) ─────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+venv/
+conda_env/
+.venv/
+env/
+.Python
+pip-log.txt
+.mypy_cache/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── OS clutter ────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Misc editor swap/backup files ────────────────────────────────────────────
+*.swp
+*.swo
+*~

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Matches ctx.getExternalFilesDir(null) — where CsvResultWriter saves CSVs -->
+    <external-files-path name="results" path="." />
+
+    <!-- Matches the Downloads folder used by ExcelExporter.exportFromCsv() on pre-API29 -->
+    <external-path name="downloads" path="Download/" />
+</paths>

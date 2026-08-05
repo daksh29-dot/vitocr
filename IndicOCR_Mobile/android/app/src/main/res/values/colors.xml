@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="purple_200">#FFBB86FC</color>
+    <color name="purple_500">#FF6200EE</color>
+    <color name="purple_700">#FF3700B3</color>
+    <color name="teal_200">#FF03DAC5</color>
+    <color name="teal_700">#FF018786</color>
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+
+    <!-- Primary App Colors -->
+    <color name="primary">#606060</color>
+    <color name="primary_dark">#404040</color>
+    <color name="accent">#9E9E9E</color>
+
+    <!-- Backgrounds -->
+    <color name="bg_light">#F5F6F8</color>
+    <color name="bg_dark">#121212</color>
+    <color name="surface_dark">#1E1E1E</color>
+
+    <!-- Text -->
+    <color name="text_primary_light">#212121</color>
+    <color name="text_secondary_light">#757575</color>
+    <color name="text_primary_dark">#E1E1E1</color>
+    <color name="text_secondary_dark">#B0B0B0</color>
+
+    <color name="preview_bg">#EEEEEE</color>
+    <color name="divider">#DDDDDD</color>
+
+    <!-- Additional UI Colors -->
+    <color name="colorAccent">@color/accent</color>
+    <color name="colorButtonLight">#E0E0E0</color>
+    <color name="colorTextPrimary">@color/text_primary_light</color>
+    <color name="colorOnAccent">#FFFFFF</color>
+</resources>

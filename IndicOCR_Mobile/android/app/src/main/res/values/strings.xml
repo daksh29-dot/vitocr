@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">OCR Tool</string>
+    <string name="settings_title">Settings &amp; Customization</string>
+    <string name="theme_selection">Theme Selection</string>
+    <string name="theme_system">Follow System</string>
+    <string name="theme_light">Light Mode</string>
+    <string name="theme_dark">Dark Mode</string>
+    <string name="result_font_size">Result Font Size</string>
+    <string name="recognition_logging">Recognition &amp; Logging</string>
+    <string name="enable_performance_logging">Enable Performance Logging</string>
+    <string name="clear_session_log">Clear Session Log</string>
+    <string name="export_log_xlsx">Export Log (XLSX)</string>
+</resources>
