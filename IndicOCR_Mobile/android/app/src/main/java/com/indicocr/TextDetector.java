@@ -1,6 +1,7 @@
 package com.indicocr;
 
 import android.content.Context;
+import android.content.res.AssetFileDescriptor;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
@@ -46,7 +47,7 @@ public final class TextDetector implements AutoCloseable {
     private static final float TEXT_THRESHOLD = 0.45f;
     private static final int MIN_BOX_SIDE = 5;
     private static final double MIN_BOX_AREA_RATIO = 0.00002;
-    private static final double OVERSIZED_ASPECT_RATIO = 3.2;
+    private static final double MAX_BOX_AREA_RATIO = 0.65;
     private static final float[] MEAN = {0.485f, 0.456f, 0.406f};
     private static final float[] STD = {0.229f, 0.224f, 0.225f};
 
@@ -64,17 +65,11 @@ public final class TextDetector implements AutoCloseable {
             }
 
             File modelFile = copyAssetToCache(context, MODEL_ASSET);
-            OrtSession.SessionOptions opts = new OrtSession.SessionOptions();
-            try {
-                opts.addNnapi();
-                Log.i(TAG, "NNAPI acceleration enabled for TextBPN detector.");
-            } catch (OrtException e) {
-                Log.i(TAG, "NNAPI unavailable for TextBPN detector; using CPU.");
+            try (OrtSession.SessionOptions cpuOpts = createSessionOptions()) {
+                session = env.createSession(modelFile.getAbsolutePath(), cpuOpts);
+                Log.i(TAG, "TextBPN detector session created with CPU.");
             }
-            opts.setIntraOpNumThreads(4);
-            opts.setInterOpNumThreads(2);
 
-            session = env.createSession(modelFile.getAbsolutePath(), opts);
             isReady = true;
             Log.i(TAG, "TextBPN detector ready.");
         } catch (Exception e) {
@@ -101,6 +96,13 @@ public final class TextDetector implements AutoCloseable {
 
     public boolean isReady() {
         return isReady;
+    }
+
+    private OrtSession.SessionOptions createSessionOptions() throws OrtException {
+        OrtSession.SessionOptions opts = new OrtSession.SessionOptions();
+        opts.setIntraOpNumThreads(2);
+        opts.setInterOpNumThreads(1);
+        return opts;
     }
 
     public List<WordSegmenter.WordBox> detect(Bitmap src) {
@@ -131,14 +133,19 @@ public final class TextDetector implements AutoCloseable {
             inputs.put("valid_mask", validMaskTensor);
 
             result = session.run(inputs);
-            float[][][][] fyPreds = (float[][][][]) result.get(0).getValue();
-            List<Rect> modelBoxes = boxesFromSegmentation(fyPreds[0], input);
-            List<WordSegmenter.WordBox> wordBoxes = splitOversizedBoxes(src, modelBoxes);
+            
+            // Access the tensor data directly to avoid allocating nested arrays for a 640x640 map.
+            OnnxTensor outputTensor = (OnnxTensor) result.get(0);
+            java.nio.FloatBuffer buffer = outputTensor.getFloatBuffer();
+            float[] fyPreds = new float[buffer.remaining()];
+            buffer.get(fyPreds);
 
-            Log.i(TAG, "TextBPN detector found " + wordBoxes.size() + " boxes");
+            List<Rect> modelBoxes = boxesFromSegmentation(fyPreds, input);
+            List<WordSegmenter.WordBox> wordBoxes = buildTextBpnWordBoxes(src, modelBoxes);
+
             return wordBoxes;
-        } catch (Exception e) {
-            Log.e(TAG, "TextBPN detection failed: " + e.getMessage(), e);
+        } catch (Throwable t) {
+            Log.e(TAG, "TextBPN detection failed: " + t.getMessage(), t);
             return new ArrayList<>();
         } finally {
             if (result != null) result.close();
@@ -159,52 +166,85 @@ public final class TextDetector implements AutoCloseable {
         Bitmap modelBitmap = Bitmap.createBitmap(MODEL_SIZE, MODEL_SIZE, Bitmap.Config.ARGB_8888);
         Canvas canvas = new Canvas(modelBitmap);
         canvas.drawColor(Color.WHITE);
-        Bitmap scaled = Bitmap.createScaledBitmap(src, scaledW, scaledH, true);
-        canvas.drawBitmap(scaled, padX, padY, new Paint(Paint.FILTER_BITMAP_FLAG));
-        if (scaled != src) scaled.recycle();
+        
+        // Use a Matrix for efficient scaling and translation in one step
+        android.graphics.Matrix matrix = new android.graphics.Matrix();
+        matrix.postScale(scale, scale);
+        matrix.postTranslate(padX, padY);
+        canvas.drawBitmap(src, matrix, new Paint(Paint.FILTER_BITMAP_FLAG));
 
         int[] pixels = new int[MODEL_SIZE * MODEL_SIZE];
         modelBitmap.getPixels(pixels, 0, MODEL_SIZE, 0, 0, MODEL_SIZE, MODEL_SIZE);
 
         float[] data = new float[3 * MODEL_SIZE * MODEL_SIZE];
         int plane = MODEL_SIZE * MODEL_SIZE;
-        for (int y = 0; y < MODEL_SIZE; y++) {
-            for (int x = 0; x < MODEL_SIZE; x++) {
-                int offset = y * MODEL_SIZE + x;
-                int px = pixels[offset];
-                data[offset] = ((Color.red(px) / 255.0f) - MEAN[0]) / STD[0];
-                data[plane + offset] = ((Color.green(px) / 255.0f) - MEAN[1]) / STD[1];
-                data[(2 * plane) + offset] = ((Color.blue(px) / 255.0f) - MEAN[2]) / STD[2];
-            }
+        for (int i = 0; i < pixels.length; i++) {
+            int px = pixels[i];
+            data[i] = (((px >> 16) & 0xFF) / 255.0f - MEAN[0]) / STD[0];
+            data[plane + i] = (((px >> 8) & 0xFF) / 255.0f - MEAN[1]) / STD[1];
+            data[(2 * plane) + i] = ((px & 0xFF) / 255.0f - MEAN[2]) / STD[2];
         }
 
         return new LetterboxInput(data, modelBitmap, scale, padX, padY);
     }
 
-    private List<Rect> boxesFromSegmentation(float[][][] channels, LetterboxInput input) {
+    private List<Rect> boxesFromSegmentation(float[] fyPreds, LetterboxInput input) {
         byte[] maskData = new byte[MODEL_SIZE * MODEL_SIZE];
-        for (int y = 0; y < MODEL_SIZE; y++) {
-            for (int x = 0; x < MODEL_SIZE; x++) {
-                float score = Math.max(channels[0][y][x], channels[1][y][x]);
-                maskData[y * MODEL_SIZE + x] = (byte) (score >= TEXT_THRESHOLD ? 255 : 0);
+        int planeSize = MODEL_SIZE * MODEL_SIZE;
+
+        if (fyPreds.length < planeSize) {
+            Log.w(TAG, "TextBPN output too small: " + fyPreds.length);
+            return new ArrayList<>();
+        }
+
+        int channelCount = Math.max(1, fyPreds.length / planeSize);
+        if (channelCount < 4) {
+            Log.w(TAG, "Unexpected TextBPN channel count: " + channelCount);
+        }
+
+        int scoreOffset = chooseSegmentationPlane(fyPreds, Math.min(channelCount, 2), planeSize);
+        if (scoreOffset < 0) {
+            Log.w(TAG, "TextBPN did not produce a usable text mask.");
+            return new ArrayList<>();
+        }
+
+        int foregroundPixels = 0;
+        for (int i = 0; i < planeSize; i++) {
+            float score = normalizeScore(fyPreds[scoreOffset + i]);
+            if (score >= TEXT_THRESHOLD) {
+                maskData[i] = (byte) 255;
+                foregroundPixels++;
             }
+        }
+
+        float coverage = foregroundPixels / (float) planeSize;
+        if (coverage > MAX_BOX_AREA_RATIO) {
+            Log.w(TAG, "TextBPN mask covers " + coverage + " of the page; rejecting oversized mask.");
+            return new ArrayList<>();
         }
 
         Mat mask = new Mat(MODEL_SIZE, MODEL_SIZE, CvType.CV_8UC1);
         mask.put(0, 0, maskData);
 
-        Mat closeKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(5, 3));
-        Mat dilateKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(9, 3));
-        Imgproc.morphologyEx(mask, mask, Imgproc.MORPH_CLOSE, closeKernel);
-        Imgproc.dilate(mask, mask, dilateKernel);
-        closeKernel.release();
-        dilateKernel.release();
-
+        Mat closeKernel = null;
+        Mat dilateKernel = null;
+        Mat hierarchy = null;
         List<MatOfPoint> contours = new ArrayList<>();
-        Mat hierarchy = new Mat();
-        Imgproc.findContours(mask, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
-        mask.release();
-        hierarchy.release();
+
+        try {
+            closeKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(5, 3));
+            dilateKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(9, 3));
+            Imgproc.morphologyEx(mask, mask, Imgproc.MORPH_CLOSE, closeKernel);
+            Imgproc.dilate(mask, mask, dilateKernel);
+
+            hierarchy = new Mat();
+            Imgproc.findContours(mask, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
+        } finally {
+            if (mask != null) mask.release();
+            if (closeKernel != null) closeKernel.release();
+            if (dilateKernel != null) dilateKernel.release();
+            if (hierarchy != null) hierarchy.release();
+        }
 
         int srcArea = MODEL_SIZE * MODEL_SIZE;
         double minArea = srcArea * MIN_BOX_AREA_RATIO;
@@ -224,6 +264,37 @@ public final class TextDetector implements AutoCloseable {
         return sortReadingOrder(boxes);
     }
 
+    private float normalizeScore(float value) {
+        if (value >= 0.0f && value <= 1.0f) return value;
+        return (float) (1.0 / (1.0 + Math.exp(-value)));
+    }
+
+    private int chooseSegmentationPlane(float[] fyPreds, int channelLimit, int planeSize) {
+        int bestChannel = -1;
+        float bestDistance = Float.MAX_VALUE;
+        final float targetCoverage = 0.12f;
+
+        for (int ch = 0; ch < channelLimit; ch++) {
+            int offset = ch * planeSize;
+            int foreground = 0;
+            for (int i = 0; i < planeSize; i++) {
+                if (normalizeScore(fyPreds[offset + i]) >= TEXT_THRESHOLD) foreground++;
+            }
+
+            float coverage = foreground / (float) planeSize;
+            Log.i(TAG, "TextBPN channel " + ch + " mask coverage=" + coverage);
+            if (coverage <= 0.0f || coverage > MAX_BOX_AREA_RATIO) continue;
+
+            float distance = Math.abs(coverage - targetCoverage);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                bestChannel = ch;
+            }
+        }
+
+        return bestChannel < 0 ? -1 : bestChannel * planeSize;
+    }
+
     private Rect mapToSource(org.opencv.core.Rect box, LetterboxInput input) {
         int left = Math.round((box.x - input.padX) / input.scale);
         int top = Math.round((box.y - input.padY) / input.scale);
@@ -240,37 +311,21 @@ public final class TextDetector implements AutoCloseable {
                 Math.max(0, bottom + marginY));
     }
 
-    private List<WordSegmenter.WordBox> splitOversizedBoxes(Bitmap src, List<Rect> boxes) {
+    private List<WordSegmenter.WordBox> buildTextBpnWordBoxes(Bitmap src, List<Rect> boxes) {
         List<WordSegmenter.WordBox> candidates = new ArrayList<>();
-        int lineIndex = 0;
 
         for (Rect box : boxes) {
             Rect bounded = boundToSource(box, src);
             if (bounded.width() <= 0 || bounded.height() <= 0) continue;
 
-            if (bounded.width() > bounded.height() * OVERSIZED_ASPECT_RATIO) {
-                Bitmap crop = WordSegmenter.crop(src, bounded);
-                if (crop != null) {
-                    List<WordSegmenter.WordBox> split = WordSegmenter.segment(crop);
-                    if (split.size() > 1) {
-                        for (WordSegmenter.WordBox sub : split) {
-                            Rect r = new Rect(
-                                    bounded.left + sub.rect.left,
-                                    bounded.top + sub.rect.top,
-                                    bounded.left + sub.rect.right,
-                                    bounded.top + sub.rect.bottom);
-                            candidates.add(new WordSegmenter.WordBox(boundToSource(r, src), lineIndex, sub.confidence));
-                        }
-                        crop.recycle();
-                        lineIndex++;
-                        continue;
-                    }
-                    crop.recycle();
-                }
-            }
+            // Previous classical oversized-box refinement intentionally disabled:
+            // if (bounded.width() > bounded.height() * OVERSIZED_ASPECT_RATIO) {
+            //     Bitmap crop = WordSegmenter.crop(src, bounded);
+            //     List<WordSegmenter.WordBox> split = WordSegmenter.segment(crop);
+            //     ...
+            // }
 
-            candidates.add(new WordSegmenter.WordBox(bounded, lineIndex, 1.0f));
-            lineIndex++;
+            candidates.add(new WordSegmenter.WordBox(bounded, 0, 1.0f));
         }
 
         List<Rect> rects = new ArrayList<>();
@@ -357,7 +412,15 @@ public final class TextDetector implements AutoCloseable {
 
     private File copyAssetToCache(Context ctx, String assetName) throws IOException {
         File outFile = new File(ctx.getCacheDir(), assetName);
-        if (outFile.exists() && outFile.length() > 0) return outFile;
+        long assetLength = -1;
+        try (AssetFileDescriptor afd = ctx.getAssets().openFd(assetName)) {
+            assetLength = afd.getLength();
+        } catch (IOException ignored) {
+        }
+        if (outFile.exists() && outFile.length() > 0
+                && (assetLength <= 0 || outFile.length() == assetLength)) {
+            return outFile;
+        }
 
         try (InputStream in = ctx.getAssets().open(assetName);
              FileOutputStream out = new FileOutputStream(outFile)) {

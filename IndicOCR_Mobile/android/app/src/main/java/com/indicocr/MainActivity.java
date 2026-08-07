@@ -84,15 +84,16 @@ public class MainActivity extends AppCompatActivity {
 
     // ── OCR ───────────────────────────────────────────────────────────────────
     private IndicOCREngine ocrEngine;
-    private TextDetector textDetector; // null if the learned detector model isn't bundled — falls back to WordSegmenter
+    private TextDetector textDetector; // TextBPN ONNX segmenter used by Page mode.
     private OnlineOcrClient onlineOcrClient;
 
     // ── Camera ────────────────────────────────────────────────────────────────
     private ImageCapture   imageCapture;
     private ExecutorService cameraExecutor;
 
-    // ── Storage / folders ────────────────────────────────────────────────────
+    // ── Storage / folders / Recognition ──────────────────────────────────────
     private ExecutorService dbExecutor;
+    private ExecutorService recognitionExecutor;
     private static final String[] FOLDERS = {"Receipts", "Notes", "Assignments", "IDs", "Others"};
 
     // ── Permission launcher ───────────────────────────────────────────────────
@@ -161,9 +162,9 @@ public class MainActivity extends AppCompatActivity {
 
         cameraExecutor = Executors.newSingleThreadExecutor();
         dbExecutor     = Executors.newSingleThreadExecutor();
+        recognitionExecutor = Executors.newSingleThreadExecutor();
 
-        // ── Init OCR engine ───────────────────────────────────────────────────
-        initOCREngine();
+        // ── Init OCR engine removed from onCreate (Lazy Loading) ───────────
 
         // ── Button listeners ──────────────────────────────────────────────────
         btnCapture.setOnClickListener(v -> captureAndRecognise());
@@ -204,9 +205,12 @@ public class MainActivity extends AppCompatActivity {
 
     @Override
     protected void onDestroy() {
-        super.onDestroy();
         cameraExecutor.shutdown();
+        dbExecutor.shutdown();
+        recognitionExecutor.shutdown();
         if (ocrEngine != null) ocrEngine.close();
+        if (textDetector != null) textDetector.close();
+        super.onDestroy();
     }
 
     private void toggleOnlineMode() {
@@ -229,31 +233,42 @@ public class MainActivity extends AppCompatActivity {
     // OCR Engine init
     // ─────────────────────────────────────────────────────────────────────────
 
-    private void initOCREngine() {
-        Executors.newSingleThreadExecutor().execute(() -> {
-            try {
-                ocrEngine = new IndicOCREngine(getApplicationContext());
-                Log.i(TAG, "OCR engine ready");
-            } catch (OrtException | IOException e) {
-                Log.e(TAG, "Failed to init OCR engine: " + e.getMessage());
-                runOnUiThread(() -> tvResult.setText("⚠ Engine init failed: " + e.getMessage()));
-            }
-
-            // Learned text detector is optional — only try to load it if the
-            // converted model has actually been bundled. Page mode falls back
-            // to WordSegmenter's classical approach if this stays null.
-            if (TextDetector.isModelBundled(getApplicationContext())) {
-                textDetector = new TextDetector(getApplicationContext());
-                Log.i(TAG, "Learned text detector ready — Page mode will use it instead of WordSegmenter");
-            } else {
-                Log.i(TAG, "No det_model.onnx bundled — Page mode will use classical WordSegmenter");
-            }
-        });
+    private boolean ensureEngineReady() {
+        if (ocrEngine != null) return true;
+        
+        Log.i(TAG, "Lazy-loading IndicOCR Engine...");
+        try {
+            ocrEngine = new IndicOCREngine(getApplicationContext());
+            Log.i(TAG, "OCR engine ready");
+            return true;
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to lazy-init OCR engine: " + e.getMessage());
+            runOnUiThread(() -> tvResult.setText("⚠ Engine init failed: " + e.getMessage()));
+            return false;
+        }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Camera
-    // ─────────────────────────────────────────────────────────────────────────
+    private boolean ensureTextDetectorReady() {
+        if (textDetector != null && textDetector.isReady()) {
+            return true;
+        }
+
+        closeTextDetector();
+        if (!TextDetector.isModelBundled(getApplicationContext())) {
+            Log.e(TAG, "TextBPN model is not bundled; Page mode segmentation is unavailable.");
+            return false;
+        }
+
+        Log.i(TAG, "Lazy-loading TextBPN detector for Page mode.");
+        textDetector = new TextDetector(getApplicationContext());
+        return textDetector.isReady();
+    }
+
+    private void closeTextDetector() {
+        if (textDetector == null) return;
+        textDetector.close();
+        textDetector = null;
+    }
 
     private void startCamera() {
         ListenableFuture<ProcessCameraProvider> future =
@@ -268,6 +283,9 @@ public class MainActivity extends AppCompatActivity {
 
                 imageCapture = new ImageCapture.Builder()
                     .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                    // Cap resolution to 1080p to prevent memory spikes during rotation/cropping.
+                    // This is plenty for OCR while being much lighter for the phone to process.
+                    .setTargetResolution(new android.util.Size(1920, 1080))
                     .build();
 
                 provider.unbindAll();
@@ -312,10 +330,11 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void processAutoCrop(File photoFile) {
+        Bitmap fullBmp = null;
         try {
             BitmapFactory.Options options = new BitmapFactory.Options();
             options.inSampleSize = 2; // Decode at half resolution for auto-crop logic (saves ~75% memory)
-            Bitmap fullBmp = BitmapFactory.decodeFile(photoFile.getAbsolutePath(), options);
+            fullBmp = BitmapFactory.decodeFile(photoFile.getAbsolutePath(), options);
             if (fullBmp == null) {
                 launchCropper(Uri.fromFile(photoFile));
                 return;
@@ -333,16 +352,16 @@ public class MainActivity extends AppCompatActivity {
             // 2. Map to Bitmap scale with padding to avoid "tight" crops that cut off text
             float scaleX = (float) fullBmp.getWidth()  / previewWidth;
             float scaleY = (float) fullBmp.getHeight() / previewHeight;
-            
+
             int cropX = Math.round(gridLeft * scaleX);
             int cropY = Math.round(gridTop  * scaleY);
             int cropW = Math.round(gridWidth * scaleX);
             int cropH = Math.round(gridHeight * scaleY);
-            
+
             // Add 25% padding around the crop area so the user can fine-tune it in uCrop
             int paddingW = cropW / 4;
             int paddingH = cropH / 4;
-            
+
             cropX -= paddingW;
             cropY -= paddingH;
             cropW += paddingW * 2;
@@ -356,25 +375,28 @@ public class MainActivity extends AppCompatActivity {
 
             if (cropW > 10 && cropH > 10) {
                 Bitmap croppedBmp = Bitmap.createBitmap(fullBmp, cropX, cropY, cropW, cropH);
-                
+
                 // Save cropped version to a new file to pass to uCrop (optional) or recogniser
                 File croppedFile = new File(getExternalCacheDir(), "autocrop_" + System.currentTimeMillis() + ".jpg");
                 try (FileOutputStream out = new FileOutputStream(croppedFile)) {
                     croppedBmp.compress(Bitmap.CompressFormat.JPEG, 90, out);
                 }
-                
+
                 // RECYCLE: Free memory immediately
                 fullBmp.recycle();
+                fullBmp = null;
                 croppedBmp.recycle();
 
                 // Pass the pre-cropped image to uCrop so the user just fine-tunes it
                 launchCropper(Uri.fromFile(croppedFile));
             } else {
                 fullBmp.recycle();
+                fullBmp = null;
                 launchCropper(Uri.fromFile(photoFile));
             }
         } catch (Exception e) {
             Log.e(TAG, "Auto-crop failed: " + e.getMessage());
+            if (fullBmp != null) fullBmp.recycle();
             launchCropper(Uri.fromFile(photoFile));
         }
     }
@@ -396,7 +418,9 @@ public class MainActivity extends AppCompatActivity {
 
             UCrop uCrop = UCrop.of(normalizedUri, destinationUri)
                 .withOptions(uOptions)
-                .withMaxResultSize(8000, 8000);
+                // DEFUSE MEMORY BOMB: Lowered from 8000 to 2000. 
+                // 8000px = 256MB RAM spike. 2000px = 16MB RAM.
+                .withMaxResultSize(2000, 2000);
 
             Intent cropIntent = uCrop.getIntent(this);
             cropIntent.setClass(this, CustomUCropActivity.class);
@@ -409,7 +433,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private Uri normalizeForCrop(Uri sourceUri) throws IOException {
-        int targetLongSide = 1600; // Slightly lower for better memory stability on low-end devices
+        int targetLongSide = 1600; // Optimal for OCR while staying memory-safe
 
         BitmapFactory.Options options = new BitmapFactory.Options();
         options.inJustDecodeBounds = true;
@@ -417,8 +441,10 @@ public class MainActivity extends AppCompatActivity {
             BitmapFactory.decodeStream(is, null, options);
         }
 
+        // Early Downsampling: If image is huge, shrink it while loading from disk
         options.inSampleSize = calculateInSampleSize(options, targetLongSide, targetLongSide);
         options.inJustDecodeBounds = false;
+        options.inPreferredConfig = Bitmap.Config.RGB_565; // 50% RAM saving immediately
 
         try (InputStream is = getContentResolver().openInputStream(sourceUri)) {
             Bitmap original = BitmapFactory.decodeStream(is, null, options);
@@ -430,10 +456,11 @@ public class MainActivity extends AppCompatActivity {
             float scale = (float) targetLongSide / longSide;
 
             Bitmap normalized;
-            if (scale < 1.0f) {
+            if (scale < 0.95f) { // Only scale if meaningfully larger
                 int newW = Math.round(w * scale);
                 int newH = Math.round(h * scale);
                 normalized = Bitmap.createScaledBitmap(original, newW, newH, true);
+                original.recycle();
             } else {
                 normalized = original;
             }
@@ -443,10 +470,7 @@ public class MainActivity extends AppCompatActivity {
                 normalized.compress(Bitmap.CompressFormat.JPEG, 90, out);
             }
             
-            if (normalized != original) original.recycle();
-            // Don't recycle normalized here if we're going to use its URI immediately, 
-            // but since we saved to file and return the URI, we can recycle if it's different.
-            // Actually, uCrop will read from the file.
+            normalized.recycle();
 
             return Uri.fromFile(tmp);
         }
@@ -472,7 +496,7 @@ public class MainActivity extends AppCompatActivity {
 
     private void recogniseFromUri(Uri uri) {
         tvResult.setText("Recognising…");
-        Executors.newSingleThreadExecutor().execute(() -> {
+        recognitionExecutor.execute(() -> {
             try {
                 Bitmap bmp = decodeSampledBitmapFromUri(uri, 1024, 1024);
                 if (bmp != null) {
@@ -496,6 +520,7 @@ public class MainActivity extends AppCompatActivity {
 
         options.inSampleSize = calculateInSampleSize(options, reqWidth, reqHeight);
         options.inJustDecodeBounds = false;
+        options.inPreferredConfig = Bitmap.Config.RGB_565; // 50% memory saving for preview
         try (InputStream is = getContentResolver().openInputStream(uri)) {
             return BitmapFactory.decodeStream(is, null, options);
         }
@@ -519,9 +544,9 @@ public class MainActivity extends AppCompatActivity {
     private void runRecognition(Bitmap bmp) {
         boolean onlineMode = AppSettings.isOnlineMode(getApplicationContext());
 
-        if (ocrEngine == null && !onlineMode) {
+        if (!onlineMode && !ensureEngineReady()) {
             runOnUiThread(() -> {
-                tvResult.setText("Engine not ready yet…");
+                tvResult.setText("Engine failed to start.");
                 btnCapture.setEnabled(true);
             });
             return;
@@ -555,19 +580,23 @@ public class MainActivity extends AppCompatActivity {
                 // word crop, one inference call, no segmentation overhead.
                 text = ocrEngine.recognise(processedBmp);
             } else {
-                List<WordSegmenter.WordBox> words = (textDetector != null)
-                        ? textDetector.detect(processedBmp)
-                        : WordSegmenter.segment(processedBmp);
+                List<WordSegmenter.WordBox> words = new ArrayList<>();
+                if (ensureTextDetectorReady()) {
+                    words = textDetector.detect(processedBmp);
+                } else {
+                    Log.e(TAG, "TextBPN detector unavailable; Page mode cannot segment locally.");
+                }
 
-                // Debug: save every detected box drawn on the page, so
-                // segmentation quality can be checked visually rather than
-                // inferred from the OCR output alone.
+                if (words.isEmpty()) {
+                    Log.w(TAG, "TextBPN returned no reliable word boxes; skipping page OCR.");
+                }
+
+                // Debug: save every detected box drawn on the page
                 String debugPath = DebugVisualizer.drawAndSave(
-                        getApplicationContext(), processedBmp, words,
-                        textDetector != null ? "detector" : "segmentation");
+                        getApplicationContext(), processedBmp, words, "final");
                 if (debugPath != null) Log.i(TAG, "Debug overlay: " + debugPath);
 
-                text = words.isEmpty() ? ocrEngine.recognise(processedBmp) : recogniseWords(processedBmp, words);
+                text = words.isEmpty() ? "" : recogniseWords(processedBmp, words);
             }
 
             long ms = System.currentTimeMillis() - t0;
@@ -580,16 +609,16 @@ public class MainActivity extends AppCompatActivity {
                     promptSaveToFolder(finalText, processedBmp);
                 }
             });
-        } catch (Exception e) {
-            Log.e(TAG, "Recognition failed", e);
+        } catch (Throwable t) {
+            Log.e(TAG, "Recognition failed", t);
             runOnUiThread(() -> {
-                tvResult.setText("Recognition failed: " + e.getMessage());
+                tvResult.setText("Recognition failed: " + t.getMessage());
                 btnCapture.setEnabled(true);
             });
         }
     }
 
-    /** Recognises every segmented word and reassembles them into lines (space within a line, newline between lines). */
+    /** Recognises every segmented word and reassembles them into lines. */
     private String recogniseWords(Bitmap page, List<WordSegmenter.WordBox> words) throws OrtException {
         StringBuilder sb = new StringBuilder();
         int currentLine = -1;
@@ -670,6 +699,9 @@ public class MainActivity extends AppCompatActivity {
 
     private void setPageMode(boolean isPage) {
         pageMode = isPage;
+        if (!isPage) {
+            closeTextDetector();
+        }
         int textPrimary = androidx.core.content.ContextCompat.getColor(this, R.color.colorTextPrimary);
 
         btnModeWord.setBackgroundResource(isPage ? 0 : R.drawable.pill_segment_selected);
@@ -706,18 +738,26 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void saveScan(String text, Bitmap bmp, String folder) {
+        // Clone the bitmap for the background save to prevent "trying to use a recycled bitmap"
+        // if the user starts a new scan while the previous one is still being saved.
+        final Bitmap bmpToSave = bmp.copy(bmp.getConfig(), false);
+        
         dbExecutor.execute(() -> {
-            String imagePath = saveThumbnail(bmp);
+            try {
+                String imagePath = saveThumbnail(bmpToSave);
 
-            Document doc = new Document();
-            doc.title = text.length() > 30 ? text.substring(0, 30) + "…" : text;
-            doc.folder = folder;
-            doc.text = text;
-            doc.imagePath = imagePath;
-            doc.dateAdded = System.currentTimeMillis();
+                Document doc = new Document();
+                doc.title = text.length() > 30 ? text.substring(0, 30) + "…" : text;
+                doc.folder = folder;
+                doc.text = text;
+                doc.imagePath = imagePath;
+                doc.dateAdded = System.currentTimeMillis();
 
-            AppDatabase.getInstance(getApplicationContext()).documentDao().insert(doc);
-            runOnUiThread(() -> Toast.makeText(this, "Saved to " + folder, Toast.LENGTH_SHORT).show());
+                AppDatabase.getInstance(getApplicationContext()).documentDao().insert(doc);
+                runOnUiThread(() -> Toast.makeText(this, "Saved to " + folder, Toast.LENGTH_SHORT).show());
+            } finally {
+                bmpToSave.recycle();
+            }
         });
     }
 

@@ -123,7 +123,16 @@ public final class WordSegmenter {
     // Safety cap so a pathological image can't recurse forever.
     private static final int MAX_RESPLIT_DEPTH = 3;
 
+    private static CLAHE cachedClahe;
+
     private WordSegmenter() {}
+
+    private static synchronized CLAHE getClahe() {
+        if (cachedClahe == null) {
+            cachedClahe = Imgproc.createCLAHE(2.0, new Size(8, 8));
+        }
+        return cachedClahe;
+    }
 
     // ── Public API ────────────────────────────────────────────────────────────
 
@@ -138,75 +147,71 @@ public final class WordSegmenter {
                 : src;
 
         Mat rgba = new Mat();
-        Utils.bitmapToMat(detectBmp, rgba);
         Mat gray = new Mat();
-        Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY);
-        rgba.release();
-
         Mat enhanced = new Mat();
         Mat binary = new Mat();
-        CLAHE clahe = null;
+        Mat kernel = null;
+        Mat dilated = new Mat();
+        Mat hierarchy = new Mat();
+        List<MatOfPoint> contours = new ArrayList<>();
 
         try {
+            Utils.bitmapToMat(detectBmp, rgba);
+            Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY);
+            rgba.release();
+
             // CLAHE (local contrast enhancement) before thresholding
-            clahe = Imgproc.createCLAHE(2.0, new Size(8, 8));
-            clahe.apply(gray, enhanced);
+            getClahe().apply(gray, enhanced);
             gray.release();
-            clahe.collectGarbage();
 
             Imgproc.GaussianBlur(enhanced, enhanced, new Size(3, 3), 0);
 
             Imgproc.threshold(enhanced, binary, 0, 255, Imgproc.THRESH_BINARY_INV + Imgproc.THRESH_OTSU);
             enhanced.release();
+
+            // Pass 1: measure actual glyph size in this image (self-tuning).
+            double medianGlyphHeight = estimateMedianGlyphHeight(binary);
+            if (medianGlyphHeight <= 0) medianGlyphHeight = 20; // fallback if measurement failed
+
+            // Pass 2: dilate with a kernel sized to what was actually measured.
+            int kernelW = clamp((int) Math.round(medianGlyphHeight * KERNEL_WIDTH_FACTOR), MIN_KERNEL_W, MAX_KERNEL_W);
+            int kernelH = clamp((int) Math.round(medianGlyphHeight * KERNEL_HEIGHT_FACTOR), MIN_KERNEL_H, MAX_KERNEL_H);
+            kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(kernelW, kernelH));
+            Imgproc.dilate(binary, dilated, kernel);
+
+            Imgproc.findContours(dilated, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
+
+            double minW = medianGlyphHeight * MIN_WORD_WIDTH_FACTOR;
+            double minH = medianGlyphHeight * MIN_WORD_HEIGHT_FACTOR;
+            double minArea = medianGlyphHeight * medianGlyphHeight * MIN_WORD_AREA_FACTOR;
+
+            List<Rect> boxes = new ArrayList<>();
+            for (MatOfPoint c : contours) {
+                org.opencv.core.Rect r = Imgproc.boundingRect(c);
+                if (r.width < minW || r.height < minH) continue;
+                if ((double) r.width * r.height < minArea) continue;
+                boxes.add(new Rect(r.x, r.y, r.x + r.width, r.y + r.height));
+            }
+
+            List<WordBox> ordered = sortReadingOrder(boxes);
+            ordered = mergeCloseWords(ordered, medianGlyphHeight);
+            ordered = splitOversizedBoxes(binary, ordered, medianGlyphHeight);
+            ordered = scaleToOriginal(ordered, scale);
+
+            return ordered;
         } catch (Exception e) {
+            throw e;
+        } finally {
+            if (detectBmp != src) detectBmp.recycle();
+            rgba.release();
             gray.release();
             enhanced.release();
             binary.release();
-            if (clahe != null) {
-                clahe.collectGarbage();
-            }
-            throw e;
+            if (kernel != null) kernel.release();
+            dilated.release();
+            hierarchy.release();
+            for (MatOfPoint c : contours) c.release();
         }
-
-        // Pass 1: measure actual glyph size in this image (self-tuning).
-        double medianGlyphHeight = estimateMedianGlyphHeight(binary);
-        if (medianGlyphHeight <= 0) medianGlyphHeight = 20; // fallback if measurement failed
-
-        // Pass 2: dilate with a kernel sized to what was actually measured.
-        int kernelW = clamp((int) Math.round(medianGlyphHeight * KERNEL_WIDTH_FACTOR), MIN_KERNEL_W, MAX_KERNEL_W);
-        int kernelH = clamp((int) Math.round(medianGlyphHeight * KERNEL_HEIGHT_FACTOR), MIN_KERNEL_H, MAX_KERNEL_H);
-        Mat kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(kernelW, kernelH));
-        Mat dilated = new Mat();
-        Imgproc.dilate(binary, dilated, kernel);
-        kernel.release();
-
-        List<MatOfPoint> contours = new ArrayList<>();
-        Mat hierarchy = new Mat();
-        Imgproc.findContours(dilated, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
-        dilated.release();
-        hierarchy.release();
-
-        double minW = medianGlyphHeight * MIN_WORD_WIDTH_FACTOR;
-        double minH = medianGlyphHeight * MIN_WORD_HEIGHT_FACTOR;
-        double minArea = medianGlyphHeight * medianGlyphHeight * MIN_WORD_AREA_FACTOR;
-
-        List<Rect> boxes = new ArrayList<>();
-        for (MatOfPoint c : contours) {
-            org.opencv.core.Rect r = Imgproc.boundingRect(c);
-            c.release();
-            if (r.width < minW || r.height < minH) continue;
-            if ((double) r.width * r.height < minArea) continue;
-            boxes.add(new Rect(r.x, r.y, r.x + r.width, r.y + r.height));
-        }
-
-        List<WordBox> ordered = sortReadingOrder(boxes);
-        ordered = mergeCloseWords(ordered, medianGlyphHeight);
-        ordered = splitOversizedBoxes(binary, ordered, medianGlyphHeight);
-        binary.release(); // safe to release now — the re-split pass above is done with it
-        ordered = scaleToOriginal(ordered, scale);
-
-        if (detectBmp != src) detectBmp.recycle();
-        return ordered;
     }
 
     /** Crops one detected word region out of the (full-resolution) source bitmap. Bounds-safe. */
@@ -223,30 +228,32 @@ public final class WordSegmenter {
 
     /** Lightly dilates just enough to solidify strokes, then measures the median contour height across the page. */
     private static double estimateMedianGlyphHeight(Mat binary) {
-        Mat lightKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(3, 3));
+        Mat lightKernel = null;
         Mat lightDilate = new Mat();
-        Imgproc.dilate(binary, lightDilate, lightKernel);
-        lightKernel.release();
-
-        List<MatOfPoint> glyphContours = new ArrayList<>();
         Mat hierarchy = new Mat();
+        List<MatOfPoint> glyphContours = new ArrayList<>();
+        
         try {
+            lightKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(3, 3));
+            Imgproc.dilate(binary, lightDilate, lightKernel);
+
             Imgproc.findContours(lightDilate, glyphContours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
+
+            List<Integer> heights = new ArrayList<>();
+            for (MatOfPoint c : glyphContours) {
+                org.opencv.core.Rect r = Imgproc.boundingRect(c);
+                if (r.height >= 4 && r.height <= 200) heights.add(r.height); // drop extreme outliers
+            }
+            
+            if (heights.isEmpty()) return -1;
+            Collections.sort(heights);
+            return heights.get(heights.size() / 2);
         } finally {
+            if (lightKernel != null) lightKernel.release();
             lightDilate.release();
             hierarchy.release();
+            for (MatOfPoint c : glyphContours) c.release();
         }
-
-        List<Integer> heights = new ArrayList<>();
-        for (MatOfPoint c : glyphContours) {
-            org.opencv.core.Rect r = Imgproc.boundingRect(c);
-            c.release();
-            if (r.height >= 4 && r.height <= 200) heights.add(r.height); // drop extreme outliers
-        }
-        
-        if (heights.isEmpty()) return -1;
-        Collections.sort(heights);
-        return heights.get(heights.size() / 2);
     }
 
     // ── Reading order (skew-tolerant) ───────────────────────────────────────
@@ -399,42 +406,42 @@ public final class WordSegmenter {
         int h = Math.min(box.height(), binary.rows() - y);
         if (w <= 0 || h <= 0) return out;
 
-        Mat region = binary.submat(new org.opencv.core.Rect(x, y, w, h));
-
-        int kernelW = clamp((int) Math.round(medianGlyphHeight * KERNEL_WIDTH_FACTOR * kernelFactor), MIN_KERNEL_W, MAX_KERNEL_W);
-        int kernelH = clamp((int) Math.round(medianGlyphHeight * KERNEL_HEIGHT_FACTOR), MIN_KERNEL_H, MAX_KERNEL_H);
-        Mat kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(kernelW, kernelH));
+        Mat region = null;
+        Mat kernel = null;
         Mat dilated = new Mat();
-        Imgproc.dilate(region, dilated, kernel);
-        kernel.release();
-
-        List<MatOfPoint> contours = new ArrayList<>();
         Mat hierarchy = new Mat();
-        Imgproc.findContours(dilated, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
-        dilated.release();
-        hierarchy.release();
+        List<MatOfPoint> contours = new ArrayList<>();
 
-        double minW = medianGlyphHeight * MIN_WORD_WIDTH_FACTOR;
-        double minH = medianGlyphHeight * MIN_WORD_HEIGHT_FACTOR;
-        double minArea = medianGlyphHeight * medianGlyphHeight * MIN_WORD_AREA_FACTOR;
+        try {
+            region = binary.submat(new org.opencv.core.Rect(x, y, w, h));
 
-        for (MatOfPoint c : contours) {
-            org.opencv.core.Rect r = Imgproc.boundingRect(c);
-            c.release();
-            if (r.width < minW || r.height < minH) continue;
-            if ((double) r.width * r.height < minArea) continue;
-            // Offset back into the full (detect-resolution) coordinate space.
-            out.add(new Rect(x + r.x, y + r.y, x + r.x + r.width, y + r.y + r.height));
+            int kernelW = clamp((int) Math.round(medianGlyphHeight * KERNEL_WIDTH_FACTOR * kernelFactor), MIN_KERNEL_W, MAX_KERNEL_W);
+            int kernelH = clamp((int) Math.round(medianGlyphHeight * KERNEL_HEIGHT_FACTOR), MIN_KERNEL_H, MAX_KERNEL_H);
+            kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(kernelW, kernelH));
+            Imgproc.dilate(region, dilated, kernel);
+
+            Imgproc.findContours(dilated, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
+
+            double minW = medianGlyphHeight * MIN_WORD_WIDTH_FACTOR;
+            double minH = medianGlyphHeight * MIN_WORD_HEIGHT_FACTOR;
+            double minArea = medianGlyphHeight * medianGlyphHeight * MIN_WORD_AREA_FACTOR;
+
+            for (MatOfPoint c : contours) {
+                org.opencv.core.Rect r = Imgproc.boundingRect(c);
+                if (r.width < minW || r.height < minH) continue;
+                if ((double) r.width * r.height < minArea) continue;
+                // Offset back into the full (detect-resolution) coordinate space.
+                out.add(new Rect(x + r.x, y + r.y, x + r.x + r.width, y + r.y + r.height));
+            }
+            
+            return out;
+        } finally {
+            if (region != null) region.release();
+            if (kernel != null) kernel.release();
+            dilated.release();
+            hierarchy.release();
+            for (MatOfPoint c : contours) c.release();
         }
-
-        // Release any leftovers in the list
-        for (MatOfPoint c : contours) {
-            c.release();
-        }
-
-        region.release();
-        out.sort((a, b) -> a.left - b.left);
-        return out;
     }
 
     // ── Coordinate mapping ────────────────────────────────────────────────────

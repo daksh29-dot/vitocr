@@ -1,6 +1,7 @@
 package com.indicocr;
 
 import android.content.Context;
+import android.content.res.AssetFileDescriptor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Color;
@@ -48,8 +49,7 @@ public class EvalEngine implements AutoCloseable {
     private static final float NORM_MEAN  = 0.5f;
     private static final float NORM_STD   = 0.5f;
 
-    //private static final String MODEL_ASSET = "vit_ctc.onnx";
-    private static final String MODEL_ASSET = "vit_ctc_int8.onnx";
+    private static final String MODEL_ASSET = "vit_ctc.onnx";
     private static final String LABELMAP_ASSET = "label_map.json";
 
     // ── Fields ──────────────────────────────────────────────────────────────
@@ -357,7 +357,7 @@ public class EvalEngine implements AutoCloseable {
     public void close() {
         try {
             if (session != null) session.close();
-            if (env     != null) env.close();
+            // DO NOT close env here. It's a singleton.
         } catch (Exception ignored) {}
     }
 
@@ -371,18 +371,20 @@ public class EvalEngine implements AutoCloseable {
     private String runORT(float[] inputData) throws OrtException {
         long[] shape = {1, CHANNELS, IMG_H, IMG_W};
         FloatBuffer buf = FloatBuffer.wrap(inputData);
-        OnnxTensor tensor = OnnxTensor.createTensor(env, buf, shape);
+        OnnxTensor tensor = null;
+        OrtSession.Result result = null;
+        try {
+            tensor = OnnxTensor.createTensor(env, buf, shape);
+            Map<String, OnnxTensor> inputs = new HashMap<>();
+            inputs.put("image", tensor);
 
-        Map<String, OnnxTensor> inputs = new HashMap<>();
-        inputs.put("image", tensor);
-
-        OrtSession.Result result = session.run(inputs);
-        float[][][] logProbs = (float[][][]) result.get(0).getValue();
-
-        tensor.close();
-        result.close();
-
-        return greedyDecode(logProbs[0]);
+            result = session.run(inputs);
+            float[][][] logProbs = (float[][][]) result.get(0).getValue();
+            return greedyDecode(logProbs[0]);
+        } finally {
+            if (result != null) result.close();
+            if (tensor != null) tensor.close();
+        }
     }
 
     // ── Preprocessing — mirrors VIT_CTC.py preprocess_image() ch=2 ──────────
@@ -411,6 +413,7 @@ public class EvalEngine implements AutoCloseable {
         }
         BitmapFactory.Options decodeOpts = new BitmapFactory.Options();
         decodeOpts.inSampleSize = inSample;
+        decodeOpts.inPreferredConfig = Bitmap.Config.RGB_565; // Lighter bitmap configuration
 
         Bitmap bmp = null;
         try {
@@ -496,7 +499,7 @@ public class EvalEngine implements AutoCloseable {
 
     private Bitmap toGrayscale(Bitmap src) {
         Bitmap out = Bitmap.createBitmap(src.getWidth(), src.getHeight(),
-                                          Bitmap.Config.ARGB_8888);
+                                          Bitmap.Config.RGB_565);
         android.graphics.Canvas canvas = new android.graphics.Canvas(out);
         android.graphics.ColorMatrix cm = new android.graphics.ColorMatrix();
         cm.setSaturation(0);
@@ -617,11 +620,11 @@ public class EvalEngine implements AutoCloseable {
 
     private OrtSession createSession(Context ctx) throws OrtException, IOException {
         File modelFile = copyAssetToCache(ctx, MODEL_ASSET);
-        OrtSession.SessionOptions opts = new OrtSession.SessionOptions();
-        try { opts.addNnapi(); } catch (OrtException ignored) {}
-        opts.setIntraOpNumThreads(4);
-        opts.setInterOpNumThreads(2);
-        return env.createSession(modelFile.getAbsolutePath(), opts);
+        try (OrtSession.SessionOptions opts = new OrtSession.SessionOptions()) {
+            opts.setIntraOpNumThreads(4);
+            opts.setInterOpNumThreads(2);
+            return env.createSession(modelFile.getAbsolutePath(), opts);
+        }
     }
 
     // ── Label map ────────────────────────────────────────────────────────────
@@ -661,7 +664,15 @@ public class EvalEngine implements AutoCloseable {
 
     private File copyAssetToCache(Context ctx, String name) throws IOException {
         File out = new File(ctx.getCacheDir(), name);
-        if (out.exists()) return out;
+        long assetLength = -1;
+        try (AssetFileDescriptor afd = ctx.getAssets().openFd(name)) {
+            assetLength = afd.getLength();
+        } catch (IOException ignored) {
+        }
+        if (out.exists() && out.length() > 0
+                && (assetLength <= 0 || out.length() == assetLength)) {
+            return out;
+        }
         try (InputStream in = ctx.getAssets().open(name);
              FileOutputStream os = new FileOutputStream(out)) {
             byte[] buf = new byte[8192]; int n;

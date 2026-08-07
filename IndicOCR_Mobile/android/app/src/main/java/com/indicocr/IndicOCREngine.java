@@ -1,6 +1,7 @@
 package com.indicocr;
 
 import android.content.Context;
+import android.content.res.AssetFileDescriptor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
@@ -36,7 +37,7 @@ import ai.onnxruntime.OrtSession;
  *   ocr.close();
  *
  * Assets expected in  src/main/assets/:
- *   vit_ctc.onnx       (or vit_ctc_int8.onnx for the quantised version)
+ *   vit_ctc.onnx       (non-quantized ViT-CTC model)
  *   label_map.json
  *
  * Gradle dependency (add to app/build.gradle):
@@ -144,7 +145,8 @@ public class IndicOCREngine implements AutoCloseable {
     @Override
     public void close() {
         try { if (session != null) session.close(); } catch (OrtException ignored) {}
-        if (env     != null) env.close();
+        // DO NOT close env here. It's a singleton that might be used by other engines
+        // (TextDetector, EvalEngine) and closing it invalidates it for the whole process.
     }
 
     // ── Preprocessing ─────────────────────────────────────────────────────────
@@ -159,28 +161,26 @@ public class IndicOCREngine implements AutoCloseable {
      *   4. Normalise: pixel = (pixel/255 - 0.5) / 0.5
      */
     private float[] preprocessBitmap(Bitmap original) {
-        // Step 0 – Add 3px white padding to each side
+        // Step 0 - Add 3px white padding to each side, matching training-time preprocessing.
         Bitmap src = addWhitePadding(original, 3);
 
-        // Step 1 – resize preserving aspect ratio, height=32, max_width=256
+        // Step 1 - resize preserving aspect ratio, height=32, max_width=256
         int srcW = src.getWidth();
         int srcH = src.getHeight();
         int newH = IMG_H;
         int newW = Math.max(1, (int) (srcW * ((float) newH / srcH)));
-        newW     = Math.min(newW, IMG_W);
+        newW = Math.min(newW, IMG_W);
 
         Bitmap resized = Bitmap.createScaledBitmap(src, newW, newH, true);
 
-        // Step 2 – convert the SMALL bitmap to grayscale
+        // Step 2 - convert the small bitmap to grayscale
         Bitmap gray = toGrayscale(resized);
 
-        // Cleanup intermediate bitmaps
         if (resized != src) resized.recycle();
         if (src != original) src.recycle();
 
-        // Step 3 – build float array with right-padding
+        // Step 3 - build float array with right-padding
         float[] data = new float[IMG_H * IMG_W];
-        // Fill with white (1.0) by default
         java.util.Arrays.fill(data, 1.0f);
 
         int[] pixels = new int[newH * newW];
@@ -189,21 +189,19 @@ public class IndicOCREngine implements AutoCloseable {
 
         for (int row = 0; row < newH; row++) {
             for (int col = 0; col < newW; col++) {
-                int px   = pixels[row * newW + col];
-                // grayscale value via luminance
+                int px = pixels[row * newW + col];
                 float lum = (Color.red(px) * 0.299f
-                           + Color.green(px) * 0.587f
-                           + Color.blue(px) * 0.114f) / 255.0f;
-                float norm = (lum - NORM_MEAN) / NORM_STD;
-                data[row * IMG_W + col] = norm;   // channel 0
+                        + Color.green(px) * 0.587f
+                        + Color.blue(px) * 0.114f) / 255.0f;
+                data[row * IMG_W + col] = (lum - NORM_MEAN) / NORM_STD;
             }
         }
 
-        // If CHANNELS == 2, add Otsu-binarised channel (simplified threshold)
+        // If CHANNELS == 2, add Otsu-binarised channel.
         if (CHANNELS == 2) {
             float[] otsu = otsuBinarise(data, IMG_H, IMG_W);
             float[] dual = new float[2 * IMG_H * IMG_W];
-            System.arraycopy(data, 0, dual, 0,              IMG_H * IMG_W);
+            System.arraycopy(data, 0, dual, 0, IMG_H * IMG_W);
             System.arraycopy(otsu, 0, dual, IMG_H * IMG_W, IMG_H * IMG_W);
             return dual;
         }
@@ -216,9 +214,9 @@ public class IndicOCREngine implements AutoCloseable {
         // Convert back to [0,255] for histogram
         int[] hist = new int[256];
         int total  = H * W;
-        for (float v : normData) {
-            int pix = Math.round((v * NORM_STD + NORM_MEAN) * 255);
-            pix = Math.max(0, Math.min(255, pix));
+        for (int i = 0; i < normData.length; i++) {
+            int pix = Math.round((normData[i] * NORM_STD + NORM_MEAN) * 255);
+            if (pix < 0) pix = 0; else if (pix > 255) pix = 255;
             hist[pix]++;
         }
         // Otsu's method
@@ -239,11 +237,13 @@ public class IndicOCREngine implements AutoCloseable {
             if (var > maxVar) { maxVar = var; threshold = t; }
         }
 
-        float[] result = new float[H * W];
+        float[] result = new float[total];
+        float normLow = (0.0f / 255.0f - NORM_MEAN) / NORM_STD;
+        float normHigh = (255.0f / 255.0f - NORM_MEAN) / NORM_STD;
+        
         for (int i = 0; i < normData.length; i++) {
             float rawPix = (normData[i] * NORM_STD + NORM_MEAN) * 255.0f;
-            float bin    = rawPix >= threshold ? 255.0f : 0.0f;
-            result[i]    = (bin / 255.0f - NORM_MEAN) / NORM_STD;
+            result[i] = rawPix >= threshold ? normHigh : normLow;
         }
         return result;
     }
@@ -259,9 +259,6 @@ public class IndicOCREngine implements AutoCloseable {
         return out;
     }
 
-    /**
-     * Adds white padding to all sides of a bitmap.
-     */
     private Bitmap addWhitePadding(Bitmap src, int padding) {
         int newW = src.getWidth() + 2 * padding;
         int newH = src.getHeight() + 2 * padding;
@@ -278,20 +275,24 @@ public class IndicOCREngine implements AutoCloseable {
         long[] shape = {1, CHANNELS, IMG_H, IMG_W};
 
         FloatBuffer buf = FloatBuffer.wrap(inputData);
-        OnnxTensor inputTensor = OnnxTensor.createTensor(env, buf, shape);
+        OnnxTensor inputTensor = null;
+        OrtSession.Result result = null;
+        try {
+            inputTensor = OnnxTensor.createTensor(env, buf, shape);
+            Map<String, OnnxTensor> inputs = new HashMap<>();
+            inputs.put("image", inputTensor);
 
-        Map<String, OnnxTensor> inputs = new HashMap<>();
-        inputs.put("image", inputTensor);
-
-        OrtSession.Result result = session.run(inputs);
-
-        // Output is log_softmax [1, T, num_classes]
-        float[][][] logProbs = (float[][][]) result.get(0).getValue();
-
-        inputTensor.close();
-        result.close();
-
-        return greedyDecode(logProbs[0]);
+            result = session.run(inputs);
+            OnnxTensor outputTensor = (OnnxTensor) result.get(0);
+            FloatBuffer outputBuffer = outputTensor.getFloatBuffer();
+            
+            // output shape is [1, SEQUENCE_LEN, num_labels]
+            int numLabels = id2char.size();
+            return greedyDecode(outputBuffer, numLabels);
+        } finally {
+            if (result != null) result.close();
+            if (inputTensor != null) inputTensor.close();
+        }
     }
 
     /** Same as runInference but for a batch of N pre-stacked, pre-preprocessed crops in one call. */
@@ -299,32 +300,39 @@ public class IndicOCREngine implements AutoCloseable {
         long[] shape = {batchSize, CHANNELS, IMG_H, IMG_W};
 
         FloatBuffer buf = FloatBuffer.wrap(batchData);
-        OnnxTensor inputTensor = OnnxTensor.createTensor(env, buf, shape);
+        OnnxTensor inputTensor = null;
+        OrtSession.Result result = null;
+        try {
+            inputTensor = OnnxTensor.createTensor(env, buf, shape);
+            Map<String, OnnxTensor> inputs = new HashMap<>();
+            inputs.put("image", inputTensor);
 
-        Map<String, OnnxTensor> inputs = new HashMap<>();
-        inputs.put("image", inputTensor);
-
-        OrtSession.Result result = session.run(inputs);
-
-        // Output is log_softmax [batchSize, T, num_classes]
-        float[][][] logProbs = (float[][][]) result.get(0).getValue();
-
-        inputTensor.close();
-
-        List<String> texts = new ArrayList<>(batchSize);
-        for (int i = 0; i < batchSize; i++) {
-            texts.add(greedyDecode(logProbs[i]));
+            result = session.run(inputs);
+            OnnxTensor outputTensor = (OnnxTensor) result.get(0);
+            FloatBuffer outputBuffer = outputTensor.getFloatBuffer();
+            
+            int numLabels = id2char.size();
+            List<String> texts = new ArrayList<>(batchSize);
+            for (int i = 0; i < batchSize; i++) {
+                // Slice buffer for each image in the batch
+                outputBuffer.position(i * SEQUENCE_LEN * numLabels);
+                texts.add(greedyDecode(outputBuffer, numLabels));
+            }
+            return texts;
+        } finally {
+            if (result != null) result.close();
+            if (inputTensor != null) inputTensor.close();
         }
-
-        result.close();
-        return texts;
     }
 
     /** Greedy CTC decode (argmax + collapse repeats + remove blank). */
-    private String greedyDecode(float[][] logProbs) {
+    private String greedyDecode(FloatBuffer logProbs, int numLabels) {
         StringBuilder sb  = new StringBuilder();
         int prevToken = -1;
-        for (float[] timestep : logProbs) {
+        
+        float[] timestep = new float[numLabels];
+        for (int t = 0; t < SEQUENCE_LEN; t++) {
+            logProbs.get(timestep);
             int best = argmax(timestep);
             if (best != prevToken && best != blankId) {
                 String ch = id2char.getOrDefault(best, "");
@@ -349,19 +357,15 @@ public class IndicOCREngine implements AutoCloseable {
         // Copy model from assets to internal storage (ORT needs a file path on Android)
         File modelFile = copyAssetToCache(ctx, MODEL_ASSET);
 
-        OrtSession.SessionOptions opts = new OrtSession.SessionOptions();
-        // Use NNAPI (Neural Network API) when available – this is the Android
-        // ARM Neural Engine accelerator. Falls back to CPU automatically.
-        try {
-            opts.addNnapi();
-            System.out.println("[IndicOCR] NNAPI acceleration enabled");
-        } catch (OrtException e) {
-            System.out.println("[IndicOCR] NNAPI not available, using CPU");
-        }
-        opts.setIntraOpNumThreads(4);
-        opts.setInterOpNumThreads(2);
+        try (OrtSession.SessionOptions opts = new OrtSession.SessionOptions()) {
+            // Use NNAPI (Neural Network API) when available – this is the Android
+            // ARM Neural Engine accelerator. Falls back to CPU automatically.
+            System.out.println("[IndicOCR] Using CPU execution for non-quantized ViT OCR");
+            opts.setIntraOpNumThreads(2);
+            opts.setInterOpNumThreads(1);
 
-        return env.createSession(modelFile.getAbsolutePath(), opts);
+            return env.createSession(modelFile.getAbsolutePath(), opts);
+        }
     }
 
     // ── Label map ─────────────────────────────────────────────────────────────
@@ -415,7 +419,15 @@ public class IndicOCREngine implements AutoCloseable {
 
     private File copyAssetToCache(Context ctx, String assetName) throws IOException {
         File outFile = new File(ctx.getCacheDir(), assetName);
-        if (outFile.exists()) return outFile;   // already copied
+        long assetLength = -1;
+        try (AssetFileDescriptor afd = ctx.getAssets().openFd(assetName)) {
+            assetLength = afd.getLength();
+        } catch (IOException ignored) {
+        }
+        if (outFile.exists() && outFile.length() > 0
+                && (assetLength <= 0 || outFile.length() == assetLength)) {
+            return outFile;
+        }
 
         try (InputStream in  = ctx.getAssets().open(assetName);
              FileOutputStream out = new FileOutputStream(outFile)) {

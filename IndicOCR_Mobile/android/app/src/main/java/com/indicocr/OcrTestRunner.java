@@ -110,6 +110,8 @@ public final class OcrTestRunner {
                 else if (pageText.length() > 0) pageText.append(" ");
                 pageText.append(text);
                 lastLine = box.lineIndex;
+
+                crop.recycle();
             }
 
             // Page-level ground-truth comparison, logged as a synthetic
@@ -118,6 +120,8 @@ public final class OcrTestRunner {
             WordSegmenter.WordBox pageBox = new WordSegmenter.WordBox(
                     new android.graphics.Rect(0, 0, page.getWidth(), page.getHeight()), -1, 1.0f);
             bench.record(pageBox, pageText.toString(), tc.expectedText, seg.detectorType + "_page", 0);
+
+            page.recycle();
         }
 
         return bench.exportCsv(context);

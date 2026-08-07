@@ -34,7 +34,7 @@ public final class DebugVisualizer {
         Bitmap debugBmp = null;
         try {
             // DOWNSCALE for debug: No need to save a 12MP debug overlay
-            int maxDim = 1200;
+            int maxDim = 1024;
             int w = src.getWidth();
             int h = src.getHeight();
             float scale = 1.0f;

@@ -357,62 +357,72 @@ public class CustomUCropActivity extends UCropActivity {
     }
 
 
+    private static CLAHE cachedClahe;
+
+    private static synchronized CLAHE getClahe() {
+        if (cachedClahe == null) {
+            cachedClahe = Imgproc.createCLAHE(2.0, new Size(8, 8));
+        }
+        return cachedClahe;
+    }
+
     /** CLAHE (local contrast) + Otsu threshold + Adaptive Dilation + contour extent. */
     private Rect detectContentBounds(Bitmap bmp) {
         if (bmp == null) return null;
+        
+        Mat rgba = null;
+        Mat gray = null;
+        Mat enhanced = null;
+        Mat binary = null;
+        Mat kernel = null;
+        Mat dilated = null;
+        Mat hierarchy = null;
+        List<MatOfPoint> contours = new ArrayList<>();
+        
+        Bitmap detectBmp = null;
+        
         try {
             // Downscale for detection (exactly like WordSegmenter) — ensures kernels
             // remain proportional and speeds up threshold/contours significantly.
             double scale = 1.0;
             int maxDim = Math.max(bmp.getWidth(), bmp.getHeight());
-            if (maxDim > 1400) {
-                scale = 1400.0 / maxDim;
+            if (maxDim > 1024) {
+                scale = 1024.0 / maxDim;
             }
 
-            Bitmap detectBmp;
             if (bmp.getConfig() == Bitmap.Config.HARDWARE || scale < 1.0) {
                 detectBmp = Bitmap.createScaledBitmap(bmp, (int) (bmp.getWidth() * scale), (int) (bmp.getHeight() * scale), true);
             } else {
                 detectBmp = bmp;
             }
 
-            Mat rgba = new Mat();
+            rgba = new Mat();
             Utils.bitmapToMat(detectBmp, rgba);
-            if (detectBmp != bmp) detectBmp.recycle();
 
-            Mat gray = new Mat();
+            gray = new Mat();
             Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY);
-            rgba.release();
 
-            CLAHE clahe = Imgproc.createCLAHE(2.0, new Size(8, 8));
-            Mat enhanced = new Mat();
-            clahe.apply(gray, enhanced);
-            gray.release();
+            enhanced = new Mat();
+            getClahe().apply(gray, enhanced);
+            
             Imgproc.GaussianBlur(enhanced, enhanced, new Size(3, 3), 0);
 
-            Mat binary = new Mat();
+            binary = new Mat();
             Imgproc.threshold(enhanced, binary, 0, 255, Imgproc.THRESH_BINARY_INV + Imgproc.THRESH_OTSU);
-            enhanced.release();
 
             // Measure typical glyph size to tune dilation
             double medianGlyphHeight = estimateMedianGlyphHeight(binary);
             if (medianGlyphHeight <= 0) medianGlyphHeight = 20;
-            Log.d(TAG, "Median glyph height (downscaled): " + medianGlyphHeight);
 
             int kernelW = clamp((int) Math.round(medianGlyphHeight * KERNEL_WIDTH_FACTOR), MIN_KERNEL_W, MAX_KERNEL_W);
             int kernelH = clamp((int) Math.round(medianGlyphHeight * KERNEL_HEIGHT_FACTOR), MIN_KERNEL_H, MAX_KERNEL_H);
             
-            Mat kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(kernelW, kernelH));
-            Mat dilated = new Mat();
+            kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(kernelW, kernelH));
+            dilated = new Mat();
             Imgproc.dilate(binary, dilated, kernel);
-            binary.release();
-            kernel.release();
 
-            List<MatOfPoint> contours = new ArrayList<>();
-            Mat hierarchy = new Mat();
+            hierarchy = new Mat();
             Imgproc.findContours(dilated, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
-            dilated.release();
-            hierarchy.release();
 
             if (contours.isEmpty()) return null;
 
@@ -423,7 +433,6 @@ public class CustomUCropActivity extends UCropActivity {
             boolean found = false;
             for (MatOfPoint c : contours) {
                 org.opencv.core.Rect r = Imgproc.boundingRect(c);
-                c.release();
                 
                 // Noise filter: ignore very small speckles
                 if (r.width < medianGlyphHeight * 0.3 && r.height < medianGlyphHeight * 0.3) continue;
@@ -449,30 +458,47 @@ public class CustomUCropActivity extends UCropActivity {
         } catch (Exception e) {
             Log.e(TAG, "Content detection failed: " + e.getMessage());
             return null;
+        } finally {
+            if (detectBmp != null && detectBmp != bmp) detectBmp.recycle();
+            if (rgba != null) rgba.release();
+            if (gray != null) gray.release();
+            if (enhanced != null) enhanced.release();
+            if (binary != null) binary.release();
+            if (kernel != null) kernel.release();
+            if (dilated != null) dilated.release();
+            if (hierarchy != null) hierarchy.release();
+            for (MatOfPoint c : contours) c.release();
         }
     }
 
     private double estimateMedianGlyphHeight(Mat binary) {
-        Mat lightKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(3, 3));
-        Mat lightDilate = new Mat();
-        Imgproc.dilate(binary, lightDilate, lightKernel);
-        lightKernel.release();
-
+        Mat lightKernel = null;
+        Mat lightDilate = null;
+        Mat hierarchy = null;
         List<MatOfPoint> glyphContours = new ArrayList<>();
-        Mat hierarchy = new Mat();
-        Imgproc.findContours(lightDilate, glyphContours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
-        lightDilate.release();
-        hierarchy.release();
+        
+        try {
+            lightKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(3, 3));
+            lightDilate = new Mat();
+            Imgproc.dilate(binary, lightDilate, lightKernel);
 
-        List<Integer> heights = new ArrayList<>();
-        for (MatOfPoint c : glyphContours) {
-            org.opencv.core.Rect r = Imgproc.boundingRect(c);
-            c.release();
-            if (r.height >= 4 && r.height <= 200) heights.add(r.height);
+            hierarchy = new Mat();
+            Imgproc.findContours(lightDilate, glyphContours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
+
+            List<Integer> heights = new ArrayList<>();
+            for (MatOfPoint c : glyphContours) {
+                org.opencv.core.Rect r = Imgproc.boundingRect(c);
+                if (r.height >= 4 && r.height <= 200) heights.add(r.height);
+            }
+            if (heights.isEmpty()) return -1;
+            Collections.sort(heights);
+            return heights.get(heights.size() / 2);
+        } finally {
+            if (lightKernel != null) lightKernel.release();
+            if (lightDilate != null) lightDilate.release();
+            if (hierarchy != null) hierarchy.release();
+            for (MatOfPoint c : glyphContours) c.release();
         }
-        if (heights.isEmpty()) return -1;
-        Collections.sort(heights);
-        return heights.get(heights.size() / 2);
     }
 
     private int clamp(int val, int min, int max) {
