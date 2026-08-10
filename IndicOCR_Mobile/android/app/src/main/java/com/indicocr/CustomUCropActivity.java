@@ -12,6 +12,8 @@ import android.widget.Toast;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import com.yalantis.ucrop.UCropActivity;
 import com.yalantis.ucrop.view.GestureCropImageView;
@@ -72,8 +74,10 @@ public class CustomUCropActivity extends UCropActivity {
     private static final float  MIN_BOX_PX  = 10f;          // Minimum size to trust a detection
 
     private final Handler handler = new Handler(Looper.getMainLooper());
+    private final ExecutorService cropDetectionExecutor = Executors.newSingleThreadExecutor();
     private int pollCount = 0;
-    private boolean isAutoPositioned = false;
+    private boolean cropBoxInitialized = false;
+    private boolean contentDetectionStarted = false;
     private TransformImageView.TransformImageListener originalListener;
 
     // ─────────────────────────────────────────────────────────────────────
@@ -108,13 +112,13 @@ public class CustomUCropActivity extends UCropActivity {
             imageView.post(this::applyStaticOverrides);
 
             // Step 2: Wrap listener to trigger auto-positioning on load complete
-            if (!isAutoPositioned) {
+            if (!cropBoxInitialized) {
                 wrapTransformImageListener(imageView);
             }
         }
 
         // Fallback polling in case listener doesn't fire or was already complete
-        if (!isAutoPositioned) {
+        if (!cropBoxInitialized) {
             pollUntilBitmapReady();
         }
     }
@@ -135,7 +139,7 @@ public class CustomUCropActivity extends UCropActivity {
             @Override
             public void onLoadComplete() {
                 if (originalListener != null) originalListener.onLoadComplete();
-                if (!isAutoPositioned) {
+                if (!cropBoxInitialized) {
                     Log.i(TAG, "onLoadComplete -> triggering auto-position");
                     fitCropBoxToImageBounds();
                 }
@@ -152,6 +156,12 @@ public class CustomUCropActivity extends UCropActivity {
     public void onPause() {
         super.onPause();
         handler.removeCallbacksAndMessages(null);
+    }
+
+    @Override
+    protected void onDestroy() {
+        cropDetectionExecutor.shutdownNow();
+        super.onDestroy();
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -259,45 +269,67 @@ public class CustomUCropActivity extends UCropActivity {
         Matrix currentMatrix = (Matrix) getFieldValue(imageView, "mCurrentImageMatrix");
         Bitmap bitmap = imageView.getViewBitmap();
 
-        if (currentMatrix == null || bitmap == null) {
-            Log.w(TAG, "Matrix or Bitmap null — retrying");
+        if (currentMatrix == null || bitmap == null || bitmap.isRecycled()) {
+            Log.w(TAG, "Matrix or Bitmap invalid — retrying");
             handler.postDelayed(this::fitCropBoxToImageBounds, 120);
             return;
         }
 
-        Rect contentPx = detectContentBounds(bitmap);
-        RectF targetRect;
-
-        if (contentPx != null) {
-            Log.i(TAG, "Content detected in pixels: " + contentPx);
-            RectF contentRectF = new RectF(contentPx.x, contentPx.y, contentPx.x + contentPx.width, contentPx.y + contentPx.height);
-            
-            targetRect = new RectF();
-            currentMatrix.mapRect(targetRect, contentRectF);
-
-            float padX = targetRect.width()  * PAD_X_RATIO;
-            float padY = targetRect.height() * PAD_Y_RATIO;
-            targetRect.inset(-padX, -padY);
-
-            float[] corners = (float[]) getFieldValue(imageView, "mCurrentImageCorners");
-            if (corners != null && corners.length >= 8) {
-                RectF imgBounds = getBounds(corners);
-                targetRect.intersect(imgBounds);
-            }
-            
-            Log.i(TAG, "Content-based crop box: " + targetRect);
-            applyFinalRect(imageView, overlayView, targetRect, true);
-        } else {
-            Log.i(TAG, "No content detected — fitting whole image");
-            float[] corners = (float[]) getFieldValue(imageView, "mCurrentImageCorners");
-            if (corners != null && corners.length >= 8) {
-                targetRect = getBounds(corners);
-                applyFinalRect(imageView, overlayView, targetRect, false);
-            }
+        Matrix detectionMatrix = new Matrix(currentMatrix);
+        float[] initialCorners = (float[]) getFieldValue(imageView, "mCurrentImageCorners");
+        if (!cropBoxInitialized && initialCorners != null && initialCorners.length >= 8) {
+            applyFinalRect(imageView, overlayView, getBounds(initialCorners), false, false);
         }
+
+        if (contentDetectionStarted) return;
+        contentDetectionStarted = true;
+
+        // DEFUSE UI FREEZE: Move OpenCV text detection to a background thread
+        cropDetectionExecutor.execute(() -> {
+            try {
+                Rect contentPx = detectContentBounds(bitmap);
+                
+                runOnUiThread(() -> {
+                    RectF targetRect;
+                    if (contentPx != null) {
+                        Log.i(TAG, "Content detected in pixels: " + contentPx);
+                        RectF contentRectF = new RectF(contentPx.x, contentPx.y, contentPx.x + contentPx.width, contentPx.y + contentPx.height);
+                        
+                        targetRect = new RectF();
+                        detectionMatrix.mapRect(targetRect, contentRectF);
+
+                        float padX = targetRect.width()  * PAD_X_RATIO;
+                        float padY = targetRect.height() * PAD_Y_RATIO;
+                        targetRect.inset(-padX, -padY);
+
+                        float[] corners = (float[]) getFieldValue(imageView, "mCurrentImageCorners");
+                        if (corners != null && corners.length >= 8) {
+                            RectF imgBounds = getBounds(corners);
+                            targetRect.intersect(imgBounds);
+                        }
+                        
+                        Log.i(TAG, "Content-based crop box: " + targetRect);
+                        applyFinalRect(imageView, overlayView, targetRect, true);
+                    } else {
+                        Log.i(TAG, "No content detected — fitting whole image");
+                        float[] corners = (float[]) getFieldValue(imageView, "mCurrentImageCorners");
+                        if (corners != null && corners.length >= 8) {
+                            targetRect = getBounds(corners);
+                            applyFinalRect(imageView, overlayView, targetRect, false);
+                        }
+                    }
+                });
+            } catch (Exception e) {
+                Log.e(TAG, "Async content detection error: " + e.getMessage());
+            }
+        });
     }
 
     private void applyFinalRect(GestureCropImageView imageView, OverlayView overlayView, RectF targetRect, boolean wasContent) {
+        applyFinalRect(imageView, overlayView, targetRect, wasContent, true);
+    }
+
+    private void applyFinalRect(GestureCropImageView imageView, OverlayView overlayView, RectF targetRect, boolean wasContent, boolean showToast) {
 
 
         if (targetRect == null || targetRect.width() < MIN_BOX_PX) {
@@ -332,7 +364,11 @@ public class CustomUCropActivity extends UCropActivity {
             overlayView.postInvalidate();
             imageView.postInvalidate();
             
-            isAutoPositioned = true;
+            cropBoxInitialized = true;
+
+            if (!showToast) {
+                return;
+            }
 
             if (wasContent) {
                 int percent = (int) ((targetRect.width() * targetRect.height()) / 
@@ -453,7 +489,7 @@ public class CustomUCropActivity extends UCropActivity {
             double inv = 1.0 / scale;
             return new Rect(
                 (int) Math.round(minX * inv), (int) Math.round(minY * inv),
-                (int) Math.round(maxX * inv), (int) Math.round(maxY * inv)
+                (int) Math.round((maxX - minX) * inv), (int) Math.round((maxY - minY) * inv)
             );
         } catch (Exception e) {
             Log.e(TAG, "Content detection failed: " + e.getMessage());

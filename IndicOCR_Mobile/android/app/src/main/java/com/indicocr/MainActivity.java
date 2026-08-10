@@ -32,6 +32,7 @@ import androidx.camera.core.Preview;
 import androidx.camera.lifecycle.ProcessCameraProvider;
 import androidx.camera.view.PreviewView;
 import androidx.core.content.ContextCompat;
+import androidx.core.content.FileProvider;
 
 import com.google.common.util.concurrent.ListenableFuture;
 import com.yalantis.ucrop.UCrop;
@@ -61,6 +62,7 @@ import ai.onnxruntime.OrtException;
 public class MainActivity extends AppCompatActivity {
 
     private static final String TAG = "IndicOCR";
+    private static final String FILE_PROVIDER_AUTHORITY = "com.indicocr.fileprovider";
 
     // ── UI ────────────────────────────────────────────────────────────────────
     private PreviewView    cameraPreview;
@@ -163,8 +165,6 @@ public class MainActivity extends AppCompatActivity {
         cameraExecutor = Executors.newSingleThreadExecutor();
         dbExecutor     = Executors.newSingleThreadExecutor();
         recognitionExecutor = Executors.newSingleThreadExecutor();
-
-        // ── Init OCR engine removed from onCreate (Lazy Loading) ───────────
 
         // ── Button listeners ──────────────────────────────────────────────────
         btnCapture.setOnClickListener(v -> captureAndRecognise());
@@ -402,43 +402,58 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void launchCropper(Uri uri) {
-        try {
-            Uri normalizedUri = normalizeForCrop(uri);
-            File croppedFile = new File(getExternalCacheDir(), "cropped_" + System.currentTimeMillis() + ".jpg");
-            Uri destinationUri = Uri.fromFile(croppedFile);
+        // DEFUSE UI BLOCK: Move heavy normalization to a background thread
+        recognitionExecutor.execute(() -> {
+            try {
+                runOnUiThread(() -> tvResult.setText("Processing image…"));
+                
+                Uri normalizedUri = normalizeForCrop(uri);
+                File croppedFile = new File(getCacheDir(), "cropped_" + System.currentTimeMillis() + ".jpg");
+                
+                Uri destinationUri = FileProvider.getUriForFile(this, FILE_PROVIDER_AUTHORITY, croppedFile);
 
-            UCrop.Options uOptions = new UCrop.Options();
-            uOptions.setFreeStyleCropEnabled(true);
-            uOptions.setShowCropGrid(false);
-            uOptions.setAllowedGestures(UCropActivity.ALL, UCropActivity.ALL, UCropActivity.ALL);
-            uOptions.setHideBottomControls(false);
-            uOptions.setImageToCropBoundsAnimDuration(100);
-            uOptions.setMaxScaleMultiplier(20f);
-            uOptions.useSourceImageAspectRatio();
+                UCrop.Options uOptions = new UCrop.Options();
+                uOptions.setFreeStyleCropEnabled(true);
+                uOptions.setShowCropGrid(false);
+                uOptions.setAllowedGestures(UCropActivity.ALL, UCropActivity.ALL, UCropActivity.ALL);
+                uOptions.setHideBottomControls(false);
+                uOptions.setImageToCropBoundsAnimDuration(100);
+                uOptions.setMaxScaleMultiplier(20f);
+                uOptions.useSourceImageAspectRatio();
 
-            UCrop uCrop = UCrop.of(normalizedUri, destinationUri)
-                .withOptions(uOptions)
-                // DEFUSE MEMORY BOMB: Lowered from 8000 to 2000. 
-                // 8000px = 256MB RAM spike. 2000px = 16MB RAM.
-                .withMaxResultSize(2000, 2000);
+                UCrop uCrop = UCrop.of(normalizedUri, destinationUri)
+                    .withOptions(uOptions)
+                    .withMaxResultSize(2000, 2000);
 
-            Intent cropIntent = uCrop.getIntent(this);
-            cropIntent.setClass(this, CustomUCropActivity.class);
-            runOnUiThread(() -> cropImage.launch(cropIntent));
-        } catch (IOException e) {
-            Log.e(TAG, "Normalization error: " + e.getMessage());
-            Toast.makeText(this, "Could not process image", Toast.LENGTH_SHORT).show();
-            btnCapture.setEnabled(true);
-        }
+                Intent cropIntent = uCrop.getIntent(this);
+                cropIntent.setClass(this, CustomUCropActivity.class);
+                cropIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                
+                runOnUiThread(() -> {
+                    cropImage.launch(cropIntent);
+                    tvResult.setText("Image ready.");
+                });
+            } catch (IOException e) {
+                Log.e(TAG, "Normalization error: " + e.getMessage());
+                runOnUiThread(() -> {
+                    Toast.makeText(this, "Could not process image", Toast.LENGTH_SHORT).show();
+                    btnCapture.setEnabled(true);
+                    tvResult.setText("Processing failed.");
+                });
+            }
+        });
     }
 
     private Uri normalizeForCrop(Uri sourceUri) throws IOException {
-        int targetLongSide = 1600; // Optimal for OCR while staying memory-safe
+        int targetLongSide = 1280; // Faster cropper startup while preserving OCR detail
 
         BitmapFactory.Options options = new BitmapFactory.Options();
         options.inJustDecodeBounds = true;
         try (InputStream is = getContentResolver().openInputStream(sourceUri)) {
             BitmapFactory.decodeStream(is, null, options);
+        }
+        if (options.outWidth <= 0 || options.outHeight <= 0) {
+            throw new IOException("Could not read image bounds");
         }
 
         // Early Downsampling: If image is huge, shrink it while loading from disk
@@ -465,14 +480,14 @@ public class MainActivity extends AppCompatActivity {
                 normalized = original;
             }
 
-            File tmp = new File(getCacheDir(), "ucrop_normalized.jpg");
+            File tmp = new File(getCacheDir(), "ucrop_normalized_" + System.currentTimeMillis() + ".jpg");
             try (FileOutputStream out = new FileOutputStream(tmp)) {
-                normalized.compress(Bitmap.CompressFormat.JPEG, 90, out);
+                normalized.compress(Bitmap.CompressFormat.JPEG, 88, out);
             }
             
             normalized.recycle();
 
-            return Uri.fromFile(tmp);
+            return FileProvider.getUriForFile(this, FILE_PROVIDER_AUTHORITY, tmp);
         }
     }
 

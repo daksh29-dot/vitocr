@@ -14,6 +14,13 @@
 # Keep JSON parsing classes (used for label_map.json)
 -keep class org.json.** { *; }
 
+# CustomUCropActivity reflects into uCrop private fields/methods by name.
+# Release minification must keep these names or the edit screen behaves
+# differently from debug.
+-keep class com.yalantis.ucrop.** { *; }
+-keepclassmembers class com.yalantis.ucrop.** { *; }
+-dontwarn com.yalantis.ucrop.**
+
 # Keep Apache POI and StAX classes (required for Excel export)
 -keep class org.apache.poi.** { *; }
 -keep class org.apache.xmlbeans.** { *; }

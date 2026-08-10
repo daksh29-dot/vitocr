@@ -5,4 +5,8 @@
 
     <!-- Matches the Downloads folder used by ExcelExporter.exportFromCsv() on pre-API29 -->
     <external-path name="downloads" path="Download/" />
+
+    <!-- Safe file sharing for uCrop and other intents -->
+    <cache-path name="internal_cache" path="." />
+    <external-cache-path name="external_cache" path="." />
 </paths>
